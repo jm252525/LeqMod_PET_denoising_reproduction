@@ -5,13 +5,14 @@ from __future__ import annotations
 import csv
 import json
 import random
+from collections import OrderedDict
 from pathlib import Path
 
 import nibabel as nib
 import numpy as np
 import torch
 from scipy import ndimage
-from torch.utils.data import Dataset, WeightedRandomSampler, get_worker_info
+from torch.utils.data import Dataset, Sampler, WeightedRandomSampler, get_worker_info
 
 
 REQUIRED_COLUMNS = {
@@ -125,6 +126,7 @@ class CSVPairDataset(Dataset):
         augmentation=True,
         rotate_degrees=10,
         enable_lemod=False,
+        reference_cache_size=1,
         seed=20260910,
         validate_paths=False,
     ):
@@ -137,8 +139,22 @@ class CSVPairDataset(Dataset):
         self.augmentation = bool(augmentation)
         self.rotate_degrees = int(rotate_degrees)
         self.enable_lemod = bool(enable_lemod)
+        self.reference_cache_size = int(reference_cache_size)
+        if self.reference_cache_size < 0:
+            raise ValueError("reference_cache_size must be non-negative")
         self.seed = int(seed)
         self.epoch = 0
+        # Dataset instances live inside DataLoader workers, so this cache and its
+        # counters are deliberately process-local and require no synchronization.
+        self._reference_cache = OrderedDict()
+        self._io_stats = {
+            "low_loads": 0,
+            "full_loads": 0,
+            "segmentation_loads": 0,
+            "reference_cache_hits": 0,
+            "reference_cache_misses": 0,
+            "reference_cache_evictions": 0,
+        }
 
         with self.csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -198,6 +214,23 @@ class CSVPairDataset(Dataset):
     def sampling_weights(self):
         return [float(row.get("leqmod_sampling_weight") or 1.0) for row in self.rows]
 
+    def group_key(self, index):
+        """Return the acquisition/reference identity used for locality-aware sampling."""
+        row = self.rows[index]
+        return (
+            row["site"], row["patient_id"], row["study_id"], row["full_count_path"],
+        )
+
+    def io_stats(self):
+        """Return I/O counters for this process-local dataset instance."""
+        return dict(self._io_stats)
+
+    def reset_io_stats(self, clear_cache=False):
+        for key in self._io_stats:
+            self._io_stats[key] = 0
+        if clear_cache:
+            self._reference_cache.clear()
+
     def summary(self):
         by_cohort = {}
         by_level = {}
@@ -212,32 +245,39 @@ class CSVPairDataset(Dataset):
             "by_cohort": dict(sorted(by_cohort.items())),
             "by_count_level": dict(sorted(by_level.items())),
             "enable_lemod": self.enable_lemod,
+            "reference_cache_size_per_worker": self.reference_cache_size,
         }
 
-    def __getitem__(self, index):
-        row = self.rows[index]
-        low_img = nib.load(row["low_count_path"])
+    def _reference_key(self, row):
+        segmentation_path = row.get("segmentation_path", "") if self.enable_lemod else ""
+        return row["full_count_path"], segmentation_path
+
+    def _load_reference(self, row):
+        key = self._reference_key(row)
+        if key in self._reference_cache:
+            self._io_stats["reference_cache_hits"] += 1
+            self._reference_cache.move_to_end(key)
+            return self._reference_cache[key]
+
+        self._io_stats["reference_cache_misses"] += 1
         high_img = nib.load(row["full_count_path"])
-        if low_img.shape != high_img.shape:
-            raise ValueError(f"Shape mismatch: {low_img.shape} vs {high_img.shape}: {row['patient_id']}")
-        affine_diff = float(np.max(np.abs(np.asarray(low_img.affine) - np.asarray(high_img.affine))))
-        if affine_diff > 1e-4:
-            raise ValueError(f"Affine mismatch {affine_diff}: {row['patient_id']}")
-        low = np.asarray(low_img.dataobj, dtype=np.float32).copy()
+        original_shape = tuple(high_img.shape)
+        affine = np.asarray(high_img.affine).copy()
         high = np.asarray(high_img.dataobj, dtype=np.float32).copy()
-        if not np.all(np.isfinite(low)) or not np.all(np.isfinite(high)):
-            raise ValueError(f"NaN/Inf detected: {row['patient_id']}")
-        low[low <= 0] = 0
+        self._io_stats["full_loads"] += 1
+        if not np.all(np.isfinite(high)):
+            raise ValueError(f"NaN/Inf detected in NORMAL image: {row['patient_id']}")
         high[high <= 0] = 0
         box = _crop_box(high, self.valid_value_threshold)
-        low = _apply_box(low, box)
-        high = _apply_box(high, box)
+        high = _apply_box(high, box).copy()
 
         if self.enable_lemod:
-            seg = np.asarray(nib.load(row["segmentation_path"]).dataobj, dtype=np.float32)
-            if seg.shape != high_img.shape:
+            seg_img = nib.load(row["segmentation_path"])
+            seg = np.asarray(seg_img.dataobj, dtype=np.float32)
+            self._io_stats["segmentation_loads"] += 1
+            if tuple(seg.shape) != original_shape:
                 raise ValueError(f"Segmentation shape mismatch: {row['patient_id']}")
-            seg = _apply_box(seg, box)
+            seg = _apply_box(seg, box).copy()
         else:
             seg = None
 
@@ -250,6 +290,43 @@ class CSVPairDataset(Dataset):
                 f"Only {len(candidates)} valid patches for {row['patient_id']}; "
                 f"requested {self.patches_per_volume}"
             )
+        reference = {
+            "original_shape": original_shape,
+            "affine": affine,
+            "high": high,
+            "seg": seg,
+            "box": box,
+            "candidates": candidates,
+        }
+        if self.reference_cache_size > 0:
+            self._reference_cache[key] = reference
+            while len(self._reference_cache) > self.reference_cache_size:
+                self._reference_cache.popitem(last=False)
+                self._io_stats["reference_cache_evictions"] += 1
+        return reference
+
+    def __getitem__(self, index):
+        row = self.rows[index]
+        reference = self._load_reference(row)
+        low_img = nib.load(row["low_count_path"])
+        if tuple(low_img.shape) != reference["original_shape"]:
+            raise ValueError(
+                f"Shape mismatch: {low_img.shape} vs {reference['original_shape']}: "
+                f"{row['patient_id']}"
+            )
+        affine_diff = float(np.max(np.abs(np.asarray(low_img.affine) - reference["affine"])))
+        if affine_diff > 1e-4:
+            raise ValueError(f"Affine mismatch {affine_diff}: {row['patient_id']}")
+        low = np.asarray(low_img.dataobj, dtype=np.float32).copy()
+        self._io_stats["low_loads"] += 1
+        if not np.all(np.isfinite(low)):
+            raise ValueError(f"NaN/Inf detected in low-count image: {row['patient_id']}")
+        low[low <= 0] = 0
+        box = reference["box"]
+        low = _apply_box(low, box)
+        high = reference["high"]
+        seg = reference["seg"]
+        candidates = reference["candidates"]
         probabilities = None
         if seg is not None:
             lesion_scores = np.asarray([
@@ -303,6 +380,59 @@ def make_weighted_sampler(dataset, seed, num_samples=None):
         replacement=True,
         generator=generator,
     )
+
+
+class VolumeGroupedWeightedSampler(Sampler):
+    """Weighted row sampling reordered into contiguous reference-volume groups.
+
+    The row indices are first drawn with replacement using exactly the manifest
+    weights. Reordering happens only after the draw, so count-level and cohort
+    sampling probabilities are unchanged while repeated DRFs reuse the cached
+    NORMAL reference and its precomputed crop/candidate boxes.
+    """
+
+    def __init__(self, dataset, seed, num_samples=None):
+        self.dataset = dataset
+        self.seed = int(seed)
+        self.num_samples = int(num_samples or len(dataset))
+        if self.num_samples <= 0:
+            raise ValueError("num_samples must be positive")
+        self.weights = torch.as_tensor(dataset.sampling_weights(), dtype=torch.double)
+        if len(self.weights) != len(dataset):
+            raise ValueError("sampling weight count does not match dataset length")
+        self.epoch = 0
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        drawn = torch.multinomial(
+            self.weights, self.num_samples, replacement=True, generator=generator
+        ).tolist()
+
+        groups = OrderedDict()
+        for index in drawn:
+            groups.setdefault(self.dataset.group_key(index), []).append(index)
+        keys = list(groups)
+        if len(keys) > 1:
+            key_order = torch.randperm(len(keys), generator=generator).tolist()
+        else:
+            key_order = list(range(len(keys)))
+        for key_index in key_order:
+            indices = groups[keys[key_index]]
+            if len(indices) > 1:
+                order = torch.randperm(len(indices), generator=generator).tolist()
+                indices = [indices[position] for position in order]
+            yield from indices
+
+
+def make_volume_grouped_weighted_sampler(dataset, seed, num_samples=None):
+    return VolumeGroupedWeightedSampler(dataset, seed, num_samples)
 
 
 def seed_worker(worker_id):

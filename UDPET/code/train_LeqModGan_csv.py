@@ -24,12 +24,22 @@ def parse_args():
     parser.add_argument("--experiment-name", default="leqmod_csv")
     parser.add_argument("--centers", nargs="*", default=[])
     parser.add_argument("--count-levels", nargs="*", default=[])
-    parser.add_argument("--sampling-mode", choices=("csv_weighted", "uniform"), default="csv_weighted")
+    parser.add_argument(
+        "--sampling-mode",
+        choices=("volume_grouped_weighted", "csv_weighted", "uniform"),
+        default="volume_grouped_weighted",
+    )
     parser.add_argument("--epoch-samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=20260910)
     parser.add_argument("--gpu-ids", default=None, help="Optional CUDA_VISIBLE_DEVICES value; no GPU is hard-coded")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--reference-cache-size", type=int, default=1,
+        help="Number of cropped NORMAL references cached in each DataLoader worker",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--patches-per-volume", type=int, default=8)
     parser.add_argument("--patch-size", nargs=3, type=int, default=[80, 80, 80])
@@ -80,6 +90,12 @@ def atomic_json(path, payload):
 
 def main():
     opts = parse_args()
+    if opts.num_workers < 0:
+        raise ValueError("--num-workers must be non-negative")
+    if opts.prefetch_factor < 1:
+        raise ValueError("--prefetch-factor must be positive")
+    if opts.reference_cache_size < 0:
+        raise ValueError("--reference-cache-size must be non-negative")
     if opts.gpu_ids is not None:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = opts.gpu_ids
@@ -89,7 +105,12 @@ def main():
     from torch.utils.data import DataLoader
     from tqdm import tqdm
 
-    from CSVPairDataset import CSVPairDataset, make_weighted_sampler, seed_worker
+    from CSVPairDataset import (
+        CSVPairDataset,
+        make_volume_grouped_weighted_sampler,
+        make_weighted_sampler,
+        seed_worker,
+    )
     from model_LeqModGan import modelGAN
 
     random.seed(opts.seed)
@@ -141,6 +162,7 @@ def main():
         augmentation=opts.augmentation,
         rotate_degrees=opts.rotate_train,
         enable_lemod=opts.enable_lemod,
+        reference_cache_size=opts.reference_cache_size,
         seed=opts.seed,
         validate_paths=opts.validate_paths,
     )
@@ -149,9 +171,12 @@ def main():
     if opts.sampling_mode == "csv_weighted":
         sampler = make_weighted_sampler(dataset, opts.seed, opts.epoch_samples)
         shuffle = False
+    elif opts.sampling_mode == "volume_grouped_weighted":
+        sampler = make_volume_grouped_weighted_sampler(dataset, opts.seed, opts.epoch_samples)
+        shuffle = False
     generator = torch.Generator().manual_seed(opts.seed)
-    loader = DataLoader(
-        dataset,
+    loader_options = dict(
+        dataset=dataset,
         batch_size=opts.batch_size,
         shuffle=shuffle,
         sampler=sampler,
@@ -159,13 +184,16 @@ def main():
         pin_memory=opts.device.type == "cuda",
         worker_init_fn=seed_worker,
         generator=generator,
-        persistent_workers=False,
     )
+    if opts.num_workers > 0:
+        loader_options["persistent_workers"] = opts.persistent_workers
+        loader_options["prefetch_factor"] = opts.prefetch_factor
+    loader = DataLoader(**loader_options)
 
     output_directory = Path(opts.output_path) / opts.experiment_name
     output_directory.mkdir(parents=True, exist_ok=True)
     config = {
-        "protocol": "udpET_csv_loader_v1_20260912",
+        "protocol": "udpet_csv_loader_v2_20260915",
         "seed": opts.seed,
         "train_csv": str(Path(opts.train_csv).resolve()),
         "train_csv_sha256": sha256(opts.train_csv),
@@ -173,6 +201,12 @@ def main():
         "filters": {"centers": opts.centers, "count_levels": opts.count_levels},
         "sampling_mode": opts.sampling_mode,
         "epoch_samples": opts.epoch_samples or len(dataset),
+        "loader": {
+            "num_workers": opts.num_workers,
+            "persistent_workers": bool(opts.persistent_workers and opts.num_workers > 0),
+            "prefetch_factor": opts.prefetch_factor if opts.num_workers > 0 else None,
+            "reference_cache_size_per_worker": opts.reference_cache_size,
+        },
         "batch_size": opts.batch_size,
         "patches_per_volume": opts.patches_per_volume,
         "patch_size": opts.patch_size,
@@ -226,6 +260,8 @@ def main():
 
     for epoch in range(start_epoch, opts.n_epochs + 1):
         dataset.set_epoch(epoch)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
         epoch_losses = []
         model.train()
         model.set_epoch(epoch)
