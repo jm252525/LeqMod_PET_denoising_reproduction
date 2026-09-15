@@ -24,6 +24,10 @@ under `/mnt/sdb/jinming.hu/UDPET/step5_env/code`.
 - No formal training checkpoint or training-loss file existed at snapshot
   time.
 
+## Project plan
+
+- [后续计划与课题创新目标差距](docs/PROJECT_ROADMAP_AND_INNOVATION_GAP.md)
+
 ## Loader optimization
 
 The default loader now combines two bounded optimizations:
