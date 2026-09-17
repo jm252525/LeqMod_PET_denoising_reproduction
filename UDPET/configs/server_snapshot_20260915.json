@@ -1,7 +1,7 @@
 {
   "snapshot": {
     "created_at": "2026-09-15T01:08:59+08:00",
-    "status": "training_engineering_smoke_passed_no_formal_run",
+    "status": "training_validation_exact_resume_gate_passed_no_formal_run",
     "last_verified_on": "2026-09-17",
     "source_code_path": "/mnt/sdb/jinming.hu/UDPET/step5_env/code",
     "repository_code_path": "/home/jinming.hu/LeqMod_PET_denoising_reproduction/UDPET/code",
@@ -34,7 +34,9 @@
     "test_scheduler_creation.py": "a2a1a777e8fe0c0f4203344ca2c3876e4246e0f5fe5eba173b271b51f5840999",
     "test_training_state.py": "4861999e647af60370c5e9c7ed92eafdf9a5434ce886f96b4bb47830037fdd31",
     "training_state.py": "fa994cff31d2985bbec4d3f0dca54f67e207372d6499d0d80e5efeb7fe6d7117",
-    "train_LeqModGan_csv.py": "597d12db46a8945b09805d32c460fb6a63031a85b6d95730459aa5ff0b9020a3"
+    "train_LeqModGan_csv.py": "4f6fa79ebb6a3d1bcf74542a2ceca83f646b0dc2c9179676331247a5ec2dd9c6",
+    "validation.py": "7176ca8e9310d2200f611ebc0b09cd877727beb32338fa8ed3c05e32abbcb60a",
+    "test_validation_metrics.py": "0439653bb0ab771aef699a4a1a30596143991a7f6a047c3e8f77b4eb6ff4f6f6"
   },
   "data_summary": {
     "cohorts": {
@@ -76,6 +78,11 @@
     "scheduler_compatible_with_torch_2_7": true,
     "exact_n_epochs_semantics": true,
     "strict_epoch_boundary_resume": true,
+    "strict_deterministic_cuda": true,
+    "exact_resumed_vs_continuous_state": true,
+    "fixed_patient_drf_validation": true,
+    "patient_bootstrap_confidence_intervals": true,
+    "test_manifest_read_by_engineering_smoke": false,
     "real_8patch_optimizer_step_passed": true,
     "loader_optimization": {
       "default_sampling_mode": "volume_grouped_weighted",
@@ -95,6 +102,28 @@
         "optimizers": true,
         "schedulers": true,
         "cpu_cuda_rng": true
+      }
+    },
+    "multi_iteration_resume_validation_smoke": {
+      "role": "engineering_diagnostic",
+      "resumed_artifact": "/mnt/sdb/jinming.hu/UDPET/training_smoke/qumod_resume_exact_v6_20260917",
+      "continuous_control_artifact": "/mnt/sdb/jinming.hu/UDPET/training_smoke/qumod_continuous_v6_20260917",
+      "optimizer_iterations": 2,
+      "patches_per_iteration": 8,
+      "fixed_validation_pairs": 2,
+      "fixed_validation_patches_per_pair": 2,
+      "bootstrap_replicates": 200,
+      "state_equivalence": {
+        "generator": true,
+        "discriminator": true,
+        "optimizers": true,
+        "schedulers": true,
+        "rng": true,
+        "loader_generator": true,
+        "sampler_epoch": true,
+        "training_contract": true,
+        "loss_csv": true,
+        "validation_artifacts": true
       }
     }
   }

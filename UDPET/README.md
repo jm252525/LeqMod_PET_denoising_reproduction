@@ -21,8 +21,9 @@ under `/mnt/sdb/jinming.hu/UDPET/step5_env/code`.
 - QuMod is enabled by the all-cohort dry-run configuration.
 - LeMod is disabled because the current manifests do not provide lesion
   segmentation paths. This snapshot is therefore not a complete LeqMod run.
-- PyTorch 2.7 scheduler creation, a real eight-patch optimizer step, and strict
-  checkpoint reload have passed. No formal training run has started.
+- PyTorch 2.7 scheduler creation, a real eight-patch optimizer step, fixed
+  patient-level validation, and an exact interrupted-versus-continuous resume
+  comparison have passed. No formal training run has started.
 
 ## Project plan
 
@@ -75,6 +76,8 @@ PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/
   /usr/bin/python3 UDPET/code/test_training_state.py
 PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/metrics_step4/pydeps \
   /usr/bin/python3 UDPET/code/test_scheduler_creation.py
+PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/metrics_step4/pydeps \
+  /usr/bin/python3 UDPET/code/test_validation_metrics.py
 ```
 
 ## Training and resume contract
@@ -89,10 +92,19 @@ PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/
 - Every sampler emits an explicit per-sample seed. Patch selection and rotation
   therefore do not depend on persistent-worker scheduling and are reproducible
   after an epoch-boundary resume.
+- Training uses strict deterministic PyTorch algorithms, the deterministic
+  cuBLAS workspace, and disables CUDA matmul/cuDNN TF32. Unsupported
+  nondeterministic operators fail instead of silently weakening the contract.
+- The checkpointed DataLoader generator is a canonical next-epoch state. It is
+  independent of worker-process creation; all scientific sample randomness is
+  carried by the sampler request seed.
 - Strict resume is the default. It rejects a changed training contract, a
   partial-epoch checkpoint, missing loss history, or a legacy checkpoint.
   `--allow-inexact-resume` is an explicit diagnostic escape hatch and must not
   be used for a formal run.
+- `--max-epochs-this-invocation` can deliberately stop a process at an epoch
+  boundary without changing `--n-epochs` or the scientific contract. This is
+  intended for restart testing and bounded scheduling, not early stopping.
 
 The real-data engineering smoke used one study with eight `80x80x80` patches,
 QuMod enabled, and one discriminator plus one generator update on physical
@@ -118,16 +130,46 @@ is the system `/usr/bin/python3`. The first path supplies PyTorch/CUDA packages;
 the second supplies NumPy/SciPy/nibabel/scikit-image and related metrics
 packages.
 
+## Fixed quantitative validation
+
+Every optimizer run now requires `--val-csv`. Validation uses a fixed,
+non-augmented set of explicit `(row_index, sample_seed)` requests and never
+reads a test manifest. Results are written below the run directory as:
+
+- `validation/epoch_NNNN_patient_metrics.csv`: one row per patient and DRF;
+- `validation/epoch_NNNN_summary.json`: per-DRF and overall means with a
+  deterministic patient bootstrap confidence interval;
+- `train_loss.csv`: training losses plus validation body RMSE, body SUVmean
+  absolute bias, and reference-hotspot absolute bias.
+
+Patch errors are pooled before each patient/DRF metric is calculated. Overall
+results first average available DRFs within a patient and then weight patients
+equally. The body is defined from NORMAL PET as SUV `> 0.2`. The high-uptake
+target is the top one percent of NORMAL body voxels per sampled patch and is
+explicitly named a reference-defined hotspot, not a lesion.
+
+The final engineering comparison used two real eight-patch optimizer updates.
+One run was stopped after epoch 1 and strictly resumed; the control ran both
+epochs continuously. G, D, both optimizers, both schedulers, training RNG,
+canonical loader generator, sampler epoch, contract hash, loss CSV, and all
+validation CSV/JSON files were exactly equal. See
+`docs/ENGINEERING_GATE_REPORT_20260917.md` for the bounded protocol and artifact
+locations. The validation subset contained only two patients, so its metric
+values are pipeline checks rather than scientific estimates.
+
 ## Remaining launch gates
 
-Scheduler, one-step optimization, eight-patch memory, and epoch-boundary resume
-are no longer blockers. Before a long baseline run, the project still needs a
-fixed validation loop with patient-level quantitative metrics and a bounded
-multi-iteration training smoke. LeMod remains unavailable until lesion masks
-are added to a versioned manifest.
+Scheduler, one-step optimization, eight-patch memory, fixed patient-level
+validation, multi-iteration execution, and exact epoch-boundary resume are no
+longer blockers. Before a long baseline run, freeze the baseline configuration,
+run the pending loader wall-clock benchmark, and predeclare the full validation
+set/checkpoint rule. LeMod remains unavailable until lesion masks are added to
+a versioned manifest.
 
 ## Layout
 
 - `code/`: UDPET adaptation plus the versioned loader optimization and tests
 - `configs/server_snapshot_20260915.json`: sanitized provenance, environment,
   dataset counts, and source hashes
+- `docs/ENGINEERING_GATE_REPORT_20260917.md`: bounded real-data engineering
+  evidence; not a QuMod efficacy result

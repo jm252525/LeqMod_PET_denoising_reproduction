@@ -31,11 +31,13 @@
 - 已实现版本化的严格 epoch-boundary checkpoint，保存模型、optimizer、scheduler、RNG、DataLoader generator、sampler epoch 和训练配置哈希；
 - 真实数据、8 个 `80³` patch、QuMod 开启的一次 D/G optimizer-step 已通过，峰值 allocated/reserved 显存分别为 7,166.5/10,196 MiB；
 - 临时 checkpoint 回读后参数、optimizer、scheduler 及 CPU/CUDA RNG 均通过一致性验证。
+- 已建立固定 validation：按 patient x DRF 聚合 body/hotspot SUV 指标，并只在患者层 bootstrap；
+- 已完成两次真实 8-patch 更新的“epoch 1 中断恢复”与“两轮连续执行”对照；模型、optimizer、scheduler、RNG、训练记录和验证产物逐项一致。
 
 ### 尚未完成
 
 - 尚无可审计的 QuMod/LeqMod 正式训练 checkpoint、训练曲线和验证结果；
-- 尚未建立固定的患者级 SUV 定量评价程序；
+- 尚未在完整 validation 集上运行预先冻结的 QuMod baseline 配置；
 - 当前网络未显式输入 DRF；
 - 尚未训练定量失败风险或置信度校准模型；
 - manifest 没有病灶分割路径，因此 LeMod 病灶采样和病灶定量损失当前不可用。
@@ -56,8 +58,8 @@ Ruijin 2023 不含 D2，导致中心/年份与 DRF 覆盖不完全平衡。D2 �
 
 | 阶段 | 目标 | 当前状态 | 到达下一阶段的关键缺口 |
 | --- | --- | --- | --- |
-| P0 数据与工程基线 | 患者级划分、可复现 loader、I/O 可用 | optimizer-step 与严格恢复已通过 | 完成墙钟速度实测和多 iteration 小训练 |
-| P1 QuMod 可复现基线 | 固定配置完成训练并报告患者级结果 | 未完成 | 固定 validation、患者级指标和短预算基线 |
+| P0 数据与工程基线 | 患者级划分、可复现 loader、I/O 可用 | 多 iteration、固定验证与精确恢复已通过 | 完成 loader 墙钟速度实测 |
+| P1 QuMod 可复现基线 | 固定配置完成训练并报告患者级结果 | 评价代码完成，训练未完成 | 冻结配置并运行完整 validation 的短预算基线 |
 | P2 全 DRF 定量保真 | 恢复质量提升且 SUV 偏差受控 | 未开始 | 固定定量终点、DRF 条件化、损失消融 |
 | P3 定量失败校准 | 对每次检查输出可靠失败概率 | 未开始 | 失败定义、校准集、风险覆盖评价 |
 | P4 患者特异性解释 | 证明患者因素改变可接受 DRF | 数据受限 | BMI、剂量、时间等患者/协议元数据 |
@@ -74,10 +76,12 @@ Ruijin 2023 不含 D2，导致中心/年份与 DRF 覆盖不完全平衡。D2 �
 1. ~~修复 PyTorch 2.7 scheduler 参数兼容性；~~（已完成）
 2. ~~加入 GPU 单次 optimizer-step、保存和恢复测试；~~（已完成）
 3. 用固定的 200–500 batches 对旧 loader 和新 loader 做墙钟时间、CPU 内存、GPU 等待时间对照；
-4. 固定随机种子、患者划分、训练预算、验证 checkpoint 和配置哈希；
-5. 明确每一轮/每个 checkpoint 的实际 optimizer updates，避免以 DataLoader batch 数代替有效更新数。
+4. ~~固定验证请求、患者级定量汇总、患者 bootstrap 和 scheduler 输入；~~（已完成）
+5. ~~实现 strict deterministic 并证明中断恢复与连续运行状态一致；~~（已完成）
+6. 在 baseline 配置中冻结随机种子、患者划分、训练预算和 checkpoint 规则；
+7. 明确每一轮/每个 checkpoint 的实际 optimizer updates，避免以 DataLoader batch 数代替有效更新数。（代码记录已完成，正式配置仍需预声明）
 
-完成标准：同一配置可重复得到相同首批索引和近似相同首步损失；训练、验证、保存、恢复均能运行；正式运行产物不写入源码目录。
+完成标准：同一配置得到相同数据请求、逐项相同的恢复/连续训练状态；训练、验证、保存、恢复均能运行；正式运行产物不写入源码目录。除墙钟性能报告外，工程闭环已经达到该标准。
 
 ### WP1：建立可审计的 QuMod 基线
 
@@ -182,8 +186,8 @@ Leave-one-DRF-out 不作为临床主任务，只作为模型遇到未训练计�
 
 ## 7. 接下来三个代码里程碑
 
-1. `engineering-gate`：scheduler、optimizer-step 和严格恢复已通过；剩余 loader 墙钟性能报告及多 iteration 小训练；
-2. `qumod-baseline`：固定配置的全 DRF baseline、患者级定量评价脚本和验证报告；
+1. `engineering-gate`：scheduler、8-patch optimizer-step、多 iteration、固定患者级验证和精确恢复已通过；仅剩 loader 墙钟性能报告；
+2. `qumod-baseline`：冻结全 DRF baseline 配置并运行完整 validation；患者级定量评价脚本已完成；
 3. `drf-conditioned-risk`：DRF 条件化消融、定量保真损失和验证集概率校准。
 
 在第 1 个里程碑通过前不启动长时间正式训练；在第 2 个里程碑完成前不把当前代码称为 QuMod 复现成功；在第 3 个里程碑完成前不声称已经验证患者特异性安全 DRF。

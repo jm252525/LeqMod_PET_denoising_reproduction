@@ -20,6 +20,11 @@ import numpy as np
 def parse_args():
     parser = argparse.ArgumentParser(description="LeqMod UDPET CSV training")
     parser.add_argument("--train-csv", required=True)
+    parser.add_argument(
+        "--val-csv",
+        default=None,
+        help="Required with --run-training; validation never reads a test manifest",
+    )
     parser.add_argument("--output-path", required=True)
     parser.add_argument("--experiment-name", default="leqmod_csv")
     parser.add_argument("--centers", nargs="*", default=[])
@@ -65,12 +70,31 @@ def parse_args():
     parser.add_argument("--plateau-step-size", type=int, default=10)
     parser.add_argument("--multi-step-size", nargs="+", type=int, default=[100, 200, 300, 400])
     parser.add_argument("--save-model-epochs", type=int, default=1)
+    parser.add_argument("--val-every-epochs", type=int, default=1)
+    parser.add_argument("--val-max-pairs", type=int, default=None)
+    parser.add_argument("--val-patches-per-volume", type=int, default=8)
+    parser.add_argument("--val-num-workers", type=int, default=2)
+    parser.add_argument("--val-bootstrap-replicates", type=int, default=1000)
+    parser.add_argument(
+        "--max-epochs-this-invocation",
+        type=int,
+        default=None,
+        help=(
+            "Bound one process invocation without changing the declared n_epochs "
+            "or strict-resume contract"
+        ),
+    )
     parser.add_argument("--resume", default=None)
     parser.add_argument(
         "--allow-inexact-resume", action="store_true",
         help="Allow legacy/incompatible checkpoints; disabled by default",
     )
     parser.add_argument("--pre-weight", default=None)
+    parser.add_argument(
+        "--run-role",
+        choices=("engineering_diagnostic", "qumod_baseline", "formal"),
+        default="engineering_diagnostic",
+    )
     parser.add_argument("--run-training", action="store_true", help="Required to start optimizer/training iterations")
     return parser.parse_args()
 
@@ -111,10 +135,17 @@ def summarize_batch(batch, torch):
     }
 
 
-def build_training_contract(opts, train_csv_sha256, effective_epoch_samples):
+def build_training_contract(
+    opts,
+    train_csv_sha256,
+    effective_epoch_samples,
+    val_csv_sha256=None,
+    effective_val_pairs=None,
+):
     return {
-        "protocol": "udpet_training_v3_20260917",
+        "protocol": "udpet_training_v6_exact_resume_20260917",
         "seed": opts.seed,
+        "run_role": opts.run_role,
         "train_csv_sha256": train_csv_sha256,
         "centers": list(opts.centers),
         "count_levels": list(opts.count_levels),
@@ -143,6 +174,26 @@ def build_training_contract(opts, train_csv_sha256, effective_epoch_samples):
         "multi_step_size": list(opts.multi_step_size),
         "device_type": opts.device.type,
         "visible_gpu_count": opts.numGPUs,
+        "numerical_determinism": {
+            "torch_deterministic_algorithms": "strict",
+            "cublas_workspace_config": ":4096:8",
+            "cuda_matmul_tf32": False,
+            "cudnn_tf32": False,
+            "sample_randomness": "explicit_sampler_request_seed",
+            "checkpoint_loader_generator": "canonical_seed_plus_completed_epoch",
+        },
+        "validation": {
+            "val_csv_sha256": val_csv_sha256,
+            "fixed_pair_requests": effective_val_pairs,
+            "patches_per_volume": opts.val_patches_per_volume,
+            "every_epochs": opts.val_every_epochs,
+            "body_mask": f"NORMAL_SUV_gt_{opts.valid_value_threshold}",
+            "hotspot": "top_1_percent_NORMAL_body_voxels_per_sampled_patch",
+            "psnr_data_range_suv": 30.0,
+            "aggregation": "patch_voxel_sums_to_patient_DRF_then_patient_bootstrap",
+            "bootstrap_replicates": opts.val_bootstrap_replicates,
+            "bootstrap_seed": opts.seed + 100000,
+        },
     }
 
 
@@ -158,13 +209,30 @@ def main():
         raise ValueError("--n-epochs must be positive")
     if opts.save_model_epochs <= 0:
         raise ValueError("--save-model-epochs must be positive")
+    if opts.val_every_epochs <= 0:
+        raise ValueError("--val-every-epochs must be positive")
+    if opts.val_num_workers < 0:
+        raise ValueError("--val-num-workers must be non-negative")
+    if opts.val_patches_per_volume <= 0:
+        raise ValueError("--val-patches-per-volume must be positive")
+    if opts.val_bootstrap_replicates <= 0:
+        raise ValueError("--val-bootstrap-replicates must be positive")
+    if opts.val_max_pairs is not None and opts.val_max_pairs <= 0:
+        raise ValueError("--val-max-pairs must be positive")
+    if opts.max_epochs_this_invocation is not None and opts.max_epochs_this_invocation <= 0:
+        raise ValueError("--max-epochs-this-invocation must be positive")
     if opts.epoch_samples is not None and opts.epoch_samples <= 0:
         raise ValueError("--epoch-samples must be positive")
     if opts.resume is not None and opts.pre_weight is not None:
         raise ValueError("--resume and --pre-weight cannot be used together")
+    if opts.run_training and opts.val_csv is None:
+        raise ValueError("--val-csv is required with --run-training")
+    if opts.run_training and opts.lr_policy == "ReduceLROnPlateau" and opts.val_every_epochs != 1:
+        raise ValueError("ReduceLROnPlateau requires --val-every-epochs 1")
     if opts.gpu_ids is not None:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = opts.gpu_ids
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
     import torch
     import torch.backends.cudnn as cudnn
@@ -185,6 +253,7 @@ def main():
         restore_rng_state,
         validate_checkpoint_contract,
     )
+    from validation import evaluate_model, write_patient_metrics_csv
 
     random.seed(opts.seed)
     np.random.seed(opts.seed)
@@ -193,6 +262,10 @@ def main():
         torch.cuda.manual_seed_all(opts.seed)
     cudnn.benchmark = False
     cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = False
+        cudnn.allow_tf32 = False
 
     if opts.device == "cpu":
         opts.device = torch.device("cpu")
@@ -263,19 +336,82 @@ def main():
         loader_options["prefetch_factor"] = opts.prefetch_factor
     loader = DataLoader(**loader_options)
 
+    val_dataset = None
+    val_sampler = None
+    val_loader = None
+    val_generator = None
+    if opts.val_csv is not None:
+        val_dataset = CSVPairDataset(
+            csv_path=opts.val_csv,
+            split="val",
+            centers=opts.centers,
+            count_levels=opts.count_levels,
+            patch_size=opts.patch_size,
+            stride_size=opts.stride_size,
+            patches_per_volume=opts.val_patches_per_volume,
+            valid_value_threshold=opts.valid_value_threshold,
+            min_valid_fraction=opts.min_valid_fraction,
+            augmentation=False,
+            rotate_degrees=0,
+            enable_lemod=False,
+            reference_cache_size=opts.reference_cache_size,
+            seed=opts.seed + 1,
+            validate_paths=opts.validate_paths,
+        )
+        val_sampler = make_epoch_shuffle_sampler(
+            val_dataset, opts.seed + 1, opts.val_max_pairs
+        )
+        val_dataset.set_epoch(0)
+        val_sampler.set_epoch(0)
+        val_generator = torch.Generator().manual_seed(opts.seed + 1)
+        val_loader_options = dict(
+            dataset=val_dataset,
+            batch_size=1,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=opts.val_num_workers,
+            pin_memory=opts.device.type == "cuda",
+            worker_init_fn=seed_worker,
+            generator=val_generator,
+        )
+        if opts.val_num_workers > 0:
+            val_loader_options["persistent_workers"] = opts.persistent_workers
+            val_loader_options["prefetch_factor"] = opts.prefetch_factor
+        val_loader = DataLoader(**val_loader_options)
+
     output_directory = Path(opts.output_path) / opts.experiment_name
     output_directory.mkdir(parents=True, exist_ok=True)
     train_csv_sha256 = sha256(opts.train_csv)
+    val_csv_sha256 = sha256(opts.val_csv) if opts.val_csv is not None else None
+    effective_val_pairs = len(val_sampler) if val_sampler is not None else None
     training_contract = build_training_contract(
-        opts, train_csv_sha256, effective_epoch_samples
+        opts,
+        train_csv_sha256,
+        effective_epoch_samples,
+        val_csv_sha256,
+        effective_val_pairs,
     )
     training_contract_sha256 = canonical_sha256(training_contract)
     config = {
-        "protocol": "udpet_training_v3_20260917",
+        "protocol": "udpet_training_v6_exact_resume_20260917",
         "seed": opts.seed,
         "train_csv": str(Path(opts.train_csv).resolve()),
         "train_csv_sha256": train_csv_sha256,
         "dataset": dataset.summary(),
+        "validation": None if val_dataset is None else {
+            "val_csv": str(Path(opts.val_csv).resolve()),
+            "val_csv_sha256": val_csv_sha256,
+            "dataset": val_dataset.summary(),
+            "fixed_pair_requests": effective_val_pairs,
+            "patches_per_volume": opts.val_patches_per_volume,
+            "num_workers": opts.val_num_workers,
+            "every_epochs": opts.val_every_epochs,
+            "bootstrap_replicates": opts.val_bootstrap_replicates,
+            "bootstrap_seed": opts.seed + 100000,
+            "body_mask": f"NORMAL SUV > {opts.valid_value_threshold}",
+            "hotspot_definition": "top 1% NORMAL body voxels per sampled patch",
+            "aggregation": "patient x DRF before patient bootstrap",
+        },
         "filters": {"centers": opts.centers, "count_levels": opts.count_levels},
         "sampling_mode": opts.sampling_mode,
         "epoch_samples": effective_epoch_samples,
@@ -284,6 +420,8 @@ def main():
             "persistent_workers": bool(opts.persistent_workers and opts.num_workers > 0),
             "prefetch_factor": opts.prefetch_factor if opts.num_workers > 0 else None,
             "reference_cache_size_per_worker": opts.reference_cache_size,
+            "sample_randomness": "explicit sampler request seed",
+            "checkpoint_generator_state": "canonical seed + completed epoch",
         },
         "batch_size": opts.batch_size,
         "patches_per_volume": opts.patches_per_volume,
@@ -296,9 +434,14 @@ def main():
         "visible_gpu_count": opts.numGPUs,
         "lemod_enabled": opts.enable_lemod,
         "qumod_enabled": not opts.disable_qumod,
-        "formal_training_authorized": opts.run_training,
+        "run_role": opts.run_role,
+        "optimizer_training_authorized": opts.run_training,
+        "formal_training_authorized": bool(
+            opts.run_training and opts.run_role == "formal"
+        ),
         "epoch_semantics": "exactly n_epochs; Python stop is exclusive",
         "n_epochs": opts.n_epochs,
+        "max_epochs_this_invocation": opts.max_epochs_this_invocation,
         "iterations_per_epoch": len(loader),
         "planned_training_iterations": opts.n_epochs * len(loader),
         "optimizer_steps_per_iteration": {"generator": 1, "discriminator": 1},
@@ -348,6 +491,12 @@ def main():
                 strict_cuda=not opts.allow_inexact_resume,
             )
         if not opts.allow_inexact_resume:
+            if training_state.get("loader_generator_state_semantics") != (
+                "canonical_seed_plus_completed_epoch"
+            ):
+                raise ValueError(
+                    "Strict resume requires the canonical loader-generator state contract"
+                )
             expected_sampler_epoch = start_epoch - 1
             if int(training_state["sampler_epoch"]) != expected_sampler_epoch:
                 raise ValueError(
@@ -367,8 +516,18 @@ def main():
             )
     checkpoints = output_directory / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
+    validation_directory = output_directory / "validation"
+    validation_directory.mkdir(parents=True, exist_ok=True)
     loss_path = output_directory / "train_loss.csv"
-    loss_header = ["completed_epoch", "total_iter", "learning_rate", *model.loss_names]
+    validation_loss_fields = [
+        "val_body_rmse_suv",
+        "val_body_suvmean_abs_bias_percent",
+        "val_hotspot_suvmean_abs_bias_percent",
+    ]
+    loss_header = [
+        "completed_epoch", "total_iter", "learning_rate",
+        *model.loss_names, *validation_loss_fields,
+    ]
     if start_epoch == 0:
         with loss_path.open("w", encoding="utf-8", newline="") as handle:
             csv.writer(handle).writerow(loss_header)
@@ -402,9 +561,15 @@ def main():
         print("TRAINING_ALREADY_COMPLETE: checkpoint reached n_epochs", flush=True)
         return
 
+    invocation_end_epoch = opts.n_epochs
+    if opts.max_epochs_this_invocation is not None:
+        invocation_end_epoch = min(
+            opts.n_epochs, start_epoch + opts.max_epochs_this_invocation
+        )
+
     smoke_path = output_directory / "loader_smoke_test.json"
     smoke_recorded = smoke_path.is_file()
-    for epoch in range(start_epoch, opts.n_epochs):
+    for epoch in range(start_epoch, invocation_end_epoch):
         dataset.set_epoch(epoch)
         sampler.set_epoch(epoch)
         epoch_losses = []
@@ -430,23 +595,84 @@ def main():
                 f"[Epoch {epoch + 1}/{opts.n_epochs}] {model.loss_summary()}"
             )
         means = {name: float(np.mean([row[name] for row in epoch_losses])) for name in model.loss_names}
-        current_lr = model.update_learning_rate(means["loss_recon"])
         completed_epoch = epoch + 1
+        val_values = {field: "" for field in validation_loss_fields}
+        validation_metric = means["loss_recon"]
+        should_validate = completed_epoch % opts.val_every_epochs == 0
+        if should_validate:
+            val_dataset.set_epoch(0)
+            val_sampler.set_epoch(0)
+            patient_rows, validation_summary = evaluate_model(
+                model,
+                val_loader,
+                body_threshold=opts.valid_value_threshold,
+                bootstrap_replicates=opts.val_bootstrap_replicates,
+                bootstrap_seed=opts.seed + 100000,
+            )
+            validation_summary.update({
+                "protocol": "udpet_patient_quant_validation_v1_20260917",
+                "completed_epoch": completed_epoch,
+                "total_iter": total_iter,
+                "fixed_pair_requests": len(val_sampler),
+                "patches_per_volume": opts.val_patches_per_volume,
+                "body_mask": f"NORMAL SUV > {opts.valid_value_threshold}",
+                "hotspot_definition": "top 1% NORMAL body voxels per sampled patch",
+                "checkpoint_selection_use": "validation_only",
+                "test_manifest_read": False,
+            })
+            metric_block = validation_summary["overall_patient_balanced"]["metrics"]
+            validation_metric = metric_block["body_rmse_suv"]["mean"]
+            val_values = {
+                "val_body_rmse_suv": validation_metric,
+                "val_body_suvmean_abs_bias_percent": (
+                    metric_block["body_suvmean_abs_bias_percent"]["mean"]
+                ),
+                "val_hotspot_suvmean_abs_bias_percent": (
+                    metric_block["hotspot_suvmean_abs_bias_percent"]["mean"]
+                ),
+            }
+            write_patient_metrics_csv(
+                validation_directory / f"epoch_{completed_epoch:04d}_patient_metrics.csv",
+                patient_rows,
+            )
+            atomic_json(
+                validation_directory / f"epoch_{completed_epoch:04d}_summary.json",
+                validation_summary,
+            )
+            print(
+                "VALIDATION=" + json.dumps({
+                    "completed_epoch": completed_epoch,
+                    **val_values,
+                    "patients": validation_summary["unique_patients"],
+                }, ensure_ascii=False),
+                flush=True,
+            )
+        current_lr = model.update_learning_rate(validation_metric)
         with loss_path.open("a", encoding="utf-8", newline="") as handle:
             csv.writer(handle).writerow([
                 completed_epoch, total_iter, current_lr,
                 *[means[name] for name in model.loss_names],
+                *[val_values[name] for name in validation_loss_fields],
             ])
         should_stop = current_lr < 1e-7
         should_save = (
             completed_epoch % opts.saveModel_epochs == 0
             or completed_epoch == opts.n_epochs
+            or completed_epoch == invocation_end_epoch
             or should_stop
         )
         if should_save:
+            canonical_loader_generator_state = (
+                torch.Generator()
+                .manual_seed(opts.seed + completed_epoch)
+                .get_state()
+            )
             training_state = {
                 "rng_state": capture_rng_state(),
-                "loader_generator_state": generator.get_state(),
+                "loader_generator_state": canonical_loader_generator_state,
+                "loader_generator_state_semantics": (
+                    "canonical_seed_plus_completed_epoch"
+                ),
                 "sampler_epoch": epoch,
                 "training_contract_sha256": training_contract_sha256,
             }
@@ -459,6 +685,14 @@ def main():
         if should_stop:
             print("Terminating training: learning rate below threshold", flush=True)
             break
+
+    if invocation_end_epoch < opts.n_epochs:
+        print(
+            "INVOCATION_LIMIT_REACHED: "
+            f"completed_epoch={invocation_end_epoch}; declared_n_epochs={opts.n_epochs}; "
+            "resume from the saved epoch-boundary checkpoint to continue",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
