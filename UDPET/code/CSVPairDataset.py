@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import random
 from collections import OrderedDict
 from pathlib import Path
@@ -138,6 +139,9 @@ class CSVPairDataset(Dataset):
         rotate_degrees=10,
         enable_lemod=False,
         reference_cache_size=1,
+        storage_backend="nifti",
+        chunk_cache_index=None,
+        hdf5_handle_cache_size=1,
         seed=20260910,
         validate_paths=False,
     ):
@@ -153,11 +157,23 @@ class CSVPairDataset(Dataset):
         self.reference_cache_size = int(reference_cache_size)
         if self.reference_cache_size < 0:
             raise ValueError("reference_cache_size must be non-negative")
+        self.storage_backend = str(storage_backend).strip().lower()
+        if self.storage_backend not in {"nifti", "hdf5"}:
+            raise ValueError(f"Unsupported storage backend: {storage_backend}")
+        self.chunk_cache_index = (
+            Path(chunk_cache_index).resolve() if chunk_cache_index is not None else None
+        )
+        self.hdf5_handle_cache_size = int(hdf5_handle_cache_size)
+        if self.hdf5_handle_cache_size < 1:
+            raise ValueError("hdf5_handle_cache_size must be positive")
+        if self.storage_backend == "hdf5" and self.chunk_cache_index is None:
+            raise ValueError("chunk_cache_index is required for the hdf5 backend")
         self.seed = int(seed)
         self.epoch = 0
         # Dataset instances live inside DataLoader workers, so this cache and its
         # counters are deliberately process-local and require no synchronization.
         self._reference_cache = OrderedDict()
+        self._hdf5_handles = OrderedDict()
         self._io_stats = {
             "low_loads": 0,
             "full_loads": 0,
@@ -165,6 +181,9 @@ class CSVPairDataset(Dataset):
             "reference_cache_hits": 0,
             "reference_cache_misses": 0,
             "reference_cache_evictions": 0,
+            "hdf5_file_opens": 0,
+            "hdf5_file_evictions": 0,
+            "hdf5_patch_reads": 0,
         }
 
         with self.csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -198,23 +217,64 @@ class CSVPairDataset(Dataset):
         if len(keys) != len(set(keys)):
             raise ValueError("Duplicate patient/study/count pair found in selected CSV rows")
         if self.enable_lemod:
+            if self.storage_backend == "hdf5":
+                raise ValueError("The experimental hdf5 backend does not yet cache lesion masks")
             if "segmentation_path" not in rows[0]:
                 raise ValueError("LeMod requires a segmentation_path column; current manifests do not contain one")
             missing_masks = [r["segmentation_path"] for r in selected if not r.get("segmentation_path")]
             if missing_masks:
                 raise ValueError(f"LeMod enabled but {len(missing_masks)} segmentation paths are empty")
+        if self.storage_backend == "hdf5":
+            self._configure_hdf5_rows(selected)
         if validate_paths:
             missing_paths = []
             for row in selected:
-                for field in ("low_count_path", "full_count_path"):
-                    if not Path(row[field]).is_file():
-                        missing_paths.append(row[field])
+                if self.storage_backend == "nifti":
+                    for field in ("low_count_path", "full_count_path"):
+                        if not Path(row[field]).is_file():
+                            missing_paths.append(row[field])
+                elif not Path(row["_hdf5_cache_path"]).is_file():
+                    missing_paths.append(row["_hdf5_cache_path"])
                 if self.enable_lemod and not Path(row["segmentation_path"]).is_file():
                     missing_paths.append(row["segmentation_path"])
             if missing_paths:
                 sample = "\n".join(missing_paths[:5])
                 raise FileNotFoundError(f"Missing {len(missing_paths)} selected files. First entries:\n{sample}")
         self.rows = selected
+
+    def _configure_hdf5_rows(self, rows):
+        with self.chunk_cache_index.open("r", encoding="utf-8") as handle:
+            index = json.load(handle)
+        if index.get("protocol") != "udpet_hdf5_patch_cache_v1":
+            raise ValueError(f"Unsupported chunk-cache protocol: {index.get('protocol')!r}")
+        configuration = index.get("configuration", {})
+        expected = {
+            "patch_size": list(self.patch_size),
+            "stride_size": list(self.stride_size),
+            "valid_value_threshold": self.valid_value_threshold,
+            "min_valid_fraction": self.min_valid_fraction,
+        }
+        for key, value in expected.items():
+            if configuration.get(key) != value:
+                raise ValueError(
+                    f"Chunk-cache {key} mismatch: {configuration.get(key)!r} != {value!r}"
+                )
+        base = self.chunk_cache_index.parent
+        entries = index.get("rows", {})
+        for row in rows:
+            source = row["low_count_path"]
+            if source not in entries:
+                raise KeyError(f"Low-count path is absent from chunk-cache index: {source}")
+            entry = entries[source]
+            cache_path = Path(entry["cache_path"])
+            if not cache_path.is_absolute():
+                cache_path = (base / cache_path).resolve()
+            if entry.get("full_count_path") != row["full_count_path"]:
+                raise ValueError(f"NORMAL source mismatch in chunk-cache index: {source}")
+            if entry.get("count_label") != row["count_label"]:
+                raise ValueError(f"Count label mismatch in chunk-cache index: {source}")
+            row["_hdf5_cache_path"] = str(cache_path)
+            row["_hdf5_low_dataset"] = entry["low_dataset"]
 
     def __len__(self):
         return len(self.rows)
@@ -257,11 +317,55 @@ class CSVPairDataset(Dataset):
             "by_count_level": dict(sorted(by_level.items())),
             "enable_lemod": self.enable_lemod,
             "reference_cache_size_per_worker": self.reference_cache_size,
+            "storage_backend": self.storage_backend,
+            "chunk_cache_index": str(self.chunk_cache_index) if self.chunk_cache_index else None,
+            "hdf5_handle_cache_size_per_worker": self.hdf5_handle_cache_size,
         }
 
     def _reference_key(self, row):
         segmentation_path = row.get("segmentation_path", "") if self.enable_lemod else ""
-        return row["full_count_path"], segmentation_path
+        storage_key = row.get("_hdf5_cache_path", row["full_count_path"])
+        return storage_key, segmentation_path
+
+    def _close_hdf5_handles(self):
+        for handle in self._hdf5_handles.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+        self._hdf5_handles.clear()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_hdf5_handles"] = OrderedDict()
+        state["_reference_cache"] = OrderedDict()
+        return state
+
+    def __del__(self):
+        handles = getattr(self, "_hdf5_handles", None)
+        if handles is not None:
+            self._close_hdf5_handles()
+
+    def _hdf5_file(self, path):
+        path = os.fspath(path)
+        if path in self._hdf5_handles:
+            self._hdf5_handles.move_to_end(path)
+            return self._hdf5_handles[path]
+        try:
+            import h5py
+        except ImportError as error:
+            raise RuntimeError(
+                "h5py is required for storage_backend='hdf5'; install the pinned "
+                "chunk-cache dependency before selecting this backend"
+            ) from error
+        handle = h5py.File(path, "r")
+        self._io_stats["hdf5_file_opens"] += 1
+        self._hdf5_handles[path] = handle
+        while len(self._hdf5_handles) > self.hdf5_handle_cache_size:
+            _, evicted = self._hdf5_handles.popitem(last=False)
+            evicted.close()
+            self._io_stats["hdf5_file_evictions"] += 1
+        return handle
 
     def _load_reference(self, row):
         key = self._reference_key(row)
@@ -271,6 +375,34 @@ class CSVPairDataset(Dataset):
             return self._reference_cache[key]
 
         self._io_stats["reference_cache_misses"] += 1
+        if self.storage_backend == "hdf5":
+            handle = self._hdf5_file(row["_hdf5_cache_path"])
+            if handle.attrs.get("protocol", "") != "udpet_hdf5_patch_cache_v1":
+                raise ValueError(f"Invalid HDF5 cache protocol: {row['_hdf5_cache_path']}")
+            original_shape = tuple(map(int, handle["normal"].shape))
+            affine = np.asarray(handle["normal"].attrs["affine"], dtype=np.float64)
+            box = tuple(map(int, handle["crop_box"][...].tolist()))
+            candidates = [tuple(map(int, item)) for item in handle["candidate_boxes"][...]]
+            if len(candidates) < self.patches_per_volume:
+                raise ValueError(
+                    f"Only {len(candidates)} cached valid patches for {row['patient_id']}; "
+                    f"requested {self.patches_per_volume}"
+                )
+            reference = {
+                "original_shape": original_shape,
+                "affine": affine,
+                "high": None,
+                "seg": None,
+                "box": box,
+                "candidates": candidates,
+            }
+            if self.reference_cache_size > 0:
+                self._reference_cache[key] = reference
+                while len(self._reference_cache) > self.reference_cache_size:
+                    self._reference_cache.popitem(last=False)
+                    self._io_stats["reference_cache_evictions"] += 1
+            return reference
+
         high_img = nib.load(row["full_count_path"])
         original_shape = tuple(high_img.shape)
         affine = np.asarray(high_img.affine).copy()
@@ -328,23 +460,7 @@ class CSVPairDataset(Dataset):
         python_rng = random.Random(sample_seed)
         row = self.rows[index]
         reference = self._load_reference(row)
-        low_img = nib.load(row["low_count_path"])
-        if tuple(low_img.shape) != reference["original_shape"]:
-            raise ValueError(
-                f"Shape mismatch: {low_img.shape} vs {reference['original_shape']}: "
-                f"{row['patient_id']}"
-            )
-        affine_diff = float(np.max(np.abs(np.asarray(low_img.affine) - reference["affine"])))
-        if affine_diff > 1e-4:
-            raise ValueError(f"Affine mismatch {affine_diff}: {row['patient_id']}")
-        low = np.asarray(low_img.dataobj, dtype=np.float32).copy()
-        self._io_stats["low_loads"] += 1
-        if not np.all(np.isfinite(low)):
-            raise ValueError(f"NaN/Inf detected in low-count image: {row['patient_id']}")
-        low[low <= 0] = 0
         box = reference["box"]
-        low = _apply_box(low, box)
-        high = reference["high"]
         seg = reference["seg"]
         candidates = reference["candidates"]
         probabilities = None
@@ -359,10 +475,46 @@ class CSVPairDataset(Dataset):
         )
 
         low_patches, high_patches, weight_patches = [], [], []
+        if self.storage_backend == "hdf5":
+            handle = self._hdf5_file(row["_hdf5_cache_path"])
+            low_source = handle[row["_hdf5_low_dataset"]]
+            high_source = handle["normal"]
+        else:
+            low_img = nib.load(row["low_count_path"])
+            if tuple(low_img.shape) != reference["original_shape"]:
+                raise ValueError(
+                    f"Shape mismatch: {low_img.shape} vs {reference['original_shape']}: "
+                    f"{row['patient_id']}"
+                )
+            affine_diff = float(np.max(np.abs(np.asarray(low_img.affine) - reference["affine"])))
+            if affine_diff > 1e-4:
+                raise ValueError(f"Affine mismatch {affine_diff}: {row['patient_id']}")
+            low = np.asarray(low_img.dataobj, dtype=np.float32).copy()
+            self._io_stats["low_loads"] += 1
+            if not np.all(np.isfinite(low)):
+                raise ValueError(f"NaN/Inf detected in low-count image: {row['patient_id']}")
+            low[low <= 0] = 0
+            low = _apply_box(low, box)
+            high = reference["high"]
         for candidate_index in chosen:
             b = candidates[int(candidate_index)]
-            low_patch = low[b[0]:b[1], b[2]:b[3], b[4]:b[5]]
-            high_patch = high[b[0]:b[1], b[2]:b[3], b[4]:b[5]]
+            if self.storage_backend == "hdf5":
+                absolute = (
+                    b[0] + box[0], b[1] + box[0],
+                    b[2] + box[2], b[3] + box[2],
+                    b[4] + box[4], b[5] + box[4],
+                )
+                slices = (
+                    slice(absolute[0], absolute[1]),
+                    slice(absolute[2], absolute[3]),
+                    slice(absolute[4], absolute[5]),
+                )
+                low_patch = np.asarray(low_source[slices], dtype=np.float32)
+                high_patch = np.asarray(high_source[slices], dtype=np.float32)
+                self._io_stats["hdf5_patch_reads"] += 2
+            else:
+                low_patch = low[b[0]:b[1], b[2]:b[3], b[4]:b[5]]
+                high_patch = high[b[0]:b[1], b[2]:b[3], b[4]:b[5]]
             weight_patch = (
                 seg[b[0]:b[1], b[2]:b[3], b[4]:b[5]]
                 if seg is not None else np.zeros(self.patch_size, dtype=np.float32)

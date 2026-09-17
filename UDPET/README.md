@@ -57,6 +57,28 @@ mean, with essentially unchanged GPU-forward wait. See
 `docs/LOADER_BENCHMARK_REPORT_20260917.md`. The grouping/cache behavior is kept
 for reproducibility, but is not considered a promoted throughput optimization.
 
+### Experimental HDF5 direct-patch backend
+
+A bounded follow-up stores one full-volume float32 NORMAL array and all
+available low-count levels in one chunked HDF5 file per study. The loader reads
+only the eight selected low/NORMAL patches instead of materializing complete
+gzip NIfTI volumes. Original NIfTI files remain immutable, and the NIfTI backend
+remains the default.
+
+On a center-balanced 24-study/135-row train pilot, the `80^3` LZF cache occupied
+12.12 GiB versus 6.04 GiB of source NIfTI. Twenty-four augmented deterministic
+requests were exactly equal between backends (`max_abs_diff=0`). A four-run
+ABBA benchmark with 100 real batches per run found 4.26x median pipeline wall
+speedup, 4.95x steady fetch speedup, and HDF5/NIfTI process-tree PSS of 0.357.
+One real eight-patch QuMod optimizer step and strict checkpoint round-trip also
+passed. This promotes the design to a full-cache candidate, not yet to the
+formal default. See `docs/HDF5_PATCH_CACHE_EXPERIMENT_20260917.md`.
+
+The optional backend requires the isolated dependency in
+`configs/hdf5_cache_requirements.txt`. Cache construction is atomic, refuses to
+overwrite by default, and supports explicit validated resume with
+`--resume-existing`.
+
 Example loader-only smoke test (no optimizer steps are run without
 `--run-training`):
 
@@ -82,6 +104,8 @@ PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/
   /usr/bin/python3 UDPET/code/test_scheduler_creation.py
 PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/metrics_step4/pydeps \
   /usr/bin/python3 UDPET/code/test_validation_metrics.py
+PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/hdf5_cache_env/pydeps:/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/metrics_step4/pydeps \
+  /usr/bin/python3 UDPET/code/test_hdf5_patch_cache.py
 ```
 
 ## Training and resume contract
@@ -180,3 +204,5 @@ unavailable until lesion masks are added to a versioned manifest.
   evidence; not a QuMod efficacy result
 - `docs/LOADER_BENCHMARK_REPORT_20260917.md`: ABBA wall-clock, memory, and
   GPU-forward starvation comparison
+- `docs/HDF5_PATCH_CACHE_EXPERIMENT_20260917.md`: direct-patch cache numerical,
+  storage, throughput, memory, and optimizer-step pilot

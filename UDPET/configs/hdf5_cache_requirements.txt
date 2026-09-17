@@ -1,0 +1,3 @@
+# Installed into an isolated pip target for the bounded chunk-cache experiment.
+# The production PyTorch and scientific dependencies remain unchanged.
+h5py==3.11.0

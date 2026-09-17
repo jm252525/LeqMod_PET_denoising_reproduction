@@ -27,6 +27,9 @@ def parse_args():
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--seed", type=int, default=20260917)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument("--storage-backend", choices=("nifti", "hdf5"), default="nifti")
+    parser.add_argument("--chunk-cache-index", default=None)
+    parser.add_argument("--hdf5-handle-cache-size", type=int, default=1)
     return parser.parse_args()
 
 
@@ -70,6 +73,8 @@ def model_options(device):
 
 def main():
     args = parse_args()
+    if args.storage_backend == "hdf5" and args.chunk_cache_index is None:
+        raise ValueError("--chunk-cache-index is required with --storage-backend hdf5")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA smoke test requested but CUDA is unavailable")
     device = torch.device("cuda:0" if args.device == "cuda" else "cpu")
@@ -90,7 +95,11 @@ def main():
         augmentation=False,
         enable_lemod=False,
         reference_cache_size=1,
+        storage_backend=args.storage_backend,
+        chunk_cache_index=args.chunk_cache_index,
+        hdf5_handle_cache_size=args.hdf5_handle_cache_size,
         seed=args.seed,
+        validate_paths=True,
     )
     sampler = make_epoch_shuffle_sampler(dataset, args.seed, num_samples=1)
     sampler.set_epoch(0)
@@ -139,6 +148,10 @@ def main():
         "seed": args.seed,
         "patches_per_volume": 8,
         "qumod_enabled": True,
+        "storage_backend": args.storage_backend,
+        "chunk_cache_index": (
+            str(Path(args.chunk_cache_index).resolve()) if args.chunk_cache_index else None
+        ),
     }
     contract_sha256 = canonical_sha256(contract)
     training_state = {
@@ -195,6 +208,8 @@ def main():
         "status": "passed",
         "protocol": contract["protocol"],
         "device": str(device),
+        "storage_backend": args.storage_backend,
+        "chunk_cache_index": contract["chunk_cache_index"],
         "patient_id": list(batch["patient_id"]),
         "count_label": list(batch["count_label"]),
         "row_index": batch["row_index"].tolist(),
