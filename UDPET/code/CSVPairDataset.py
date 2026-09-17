@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import random
 from collections import OrderedDict
@@ -12,7 +13,7 @@ import nibabel as nib
 import numpy as np
 import torch
 from scipy import ndimage
-from torch.utils.data import Dataset, Sampler, WeightedRandomSampler, get_worker_info
+from torch.utils.data import Dataset, Sampler
 
 
 REQUIRED_COLUMNS = {
@@ -109,6 +110,16 @@ def _candidate_boxes(reference, patch_size, stride_size, threshold, min_valid_fr
                 if _box_sum(integral, x, y, z, px, py, pz) > minimum:
                     boxes.append((x, x + px, y, y + py, z, z + pz))
     return boxes
+
+
+def _sample_seed(seed, epoch, draw_position, row_index):
+    payload = f"{int(seed)}:{int(epoch)}:{int(draw_position)}:{int(row_index)}".encode("ascii")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:4], byteorder="little")
+
+
+def _sample_request(row_index, seed, epoch, draw_position):
+    row_index = int(row_index)
+    return row_index, _sample_seed(seed, epoch, draw_position, row_index)
 
 
 class CSVPairDataset(Dataset):
@@ -306,6 +317,15 @@ class CSVPairDataset(Dataset):
         return reference
 
     def __getitem__(self, index):
+        if isinstance(index, (tuple, list)):
+            if len(index) != 2:
+                raise ValueError(f"Sample request must be (row_index, sample_seed), got {index!r}")
+            index, sample_seed = int(index[0]), int(index[1])
+        else:
+            index = int(index)
+            sample_seed = _sample_seed(self.seed, self.epoch, 0, index)
+        numpy_rng = np.random.RandomState(sample_seed)
+        python_rng = random.Random(sample_seed)
         row = self.rows[index]
         reference = self._load_reference(row)
         low_img = nib.load(row["low_count_path"])
@@ -334,7 +354,7 @@ class CSVPairDataset(Dataset):
             ], dtype=np.float64)
             lesion_scores = np.maximum(lesion_scores, 0.2)
             probabilities = lesion_scores / lesion_scores.sum()
-        chosen = np.random.choice(
+        chosen = numpy_rng.choice(
             len(candidates), size=self.patches_per_volume, replace=False, p=probabilities
         )
 
@@ -347,8 +367,8 @@ class CSVPairDataset(Dataset):
                 seg[b[0]:b[1], b[2]:b[3], b[4]:b[5]]
                 if seg is not None else np.zeros(self.patch_size, dtype=np.float32)
             )
-            if self.augmentation and random.random() > 0.8:
-                angle = random.randint(-self.rotate_degrees, self.rotate_degrees)
+            if self.augmentation and python_rng.random() > 0.8:
+                angle = python_rng.randint(-self.rotate_degrees, self.rotate_degrees)
                 low_patch = ndimage.rotate(low_patch, angle, axes=(1, 2), reshape=False, mode="reflect")
                 high_patch = ndimage.rotate(high_patch, angle, axes=(1, 2), reshape=False, mode="reflect")
                 weight_patch = ndimage.rotate(weight_patch, angle, axes=(1, 2), reshape=False, mode="reflect")
@@ -368,28 +388,13 @@ class CSVPairDataset(Dataset):
             "count_label": row["count_label"],
             "count_percent": float(row["count_percent"]),
             "crop_box": json.dumps(box),
+            "sample_seed": sample_seed,
+            "row_index": index,
         }
 
 
-def make_weighted_sampler(dataset, seed, num_samples=None):
-    generator = torch.Generator()
-    generator.manual_seed(int(seed))
-    return WeightedRandomSampler(
-        weights=torch.as_tensor(dataset.sampling_weights(), dtype=torch.double),
-        num_samples=int(num_samples or len(dataset)),
-        replacement=True,
-        generator=generator,
-    )
-
-
-class VolumeGroupedWeightedSampler(Sampler):
-    """Weighted row sampling reordered into contiguous reference-volume groups.
-
-    The row indices are first drawn with replacement using exactly the manifest
-    weights. Reordering happens only after the draw, so count-level and cohort
-    sampling probabilities are unchanged while repeated DRFs reuse the cached
-    NORMAL reference and its precomputed crop/candidate boxes.
-    """
+class EpochWeightedSampler(Sampler):
+    """Deterministic weighted sampling with explicit per-sample RNG requests."""
 
     def __init__(self, dataset, seed, num_samples=None):
         self.dataset = dataset
@@ -408,16 +413,66 @@ class VolumeGroupedWeightedSampler(Sampler):
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
 
-    def __iter__(self):
-        generator = torch.Generator()
-        generator.manual_seed(self.seed + self.epoch)
-        drawn = torch.multinomial(
+    def _draw(self, generator):
+        return torch.multinomial(
             self.weights, self.num_samples, replacement=True, generator=generator
         ).tolist()
 
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        for draw_position, row_index in enumerate(self._draw(generator)):
+            yield _sample_request(row_index, self.seed, self.epoch, draw_position)
+
+
+class EpochShuffleSampler(Sampler):
+    """Deterministic without-replacement sampling for uniform-mode runs."""
+
+    def __init__(self, dataset, seed, num_samples=None):
+        self.dataset = dataset
+        self.seed = int(seed)
+        self.num_samples = int(num_samples or len(dataset))
+        if self.num_samples <= 0 or self.num_samples > len(dataset):
+            raise ValueError("uniform num_samples must be in [1, len(dataset)]")
+        self.epoch = 0
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        drawn = torch.randperm(len(self.dataset), generator=generator)[:self.num_samples].tolist()
+        for draw_position, row_index in enumerate(drawn):
+            yield _sample_request(row_index, self.seed, self.epoch, draw_position)
+
+
+def make_weighted_sampler(dataset, seed, num_samples=None):
+    return EpochWeightedSampler(dataset, seed, num_samples)
+
+
+def make_epoch_shuffle_sampler(dataset, seed, num_samples=None):
+    return EpochShuffleSampler(dataset, seed, num_samples)
+
+
+class VolumeGroupedWeightedSampler(EpochWeightedSampler):
+    """Weighted row sampling reordered into contiguous reference-volume groups.
+
+    The row indices are first drawn with replacement using exactly the manifest
+    weights. Reordering happens only after the draw, so count-level and cohort
+    sampling probabilities are unchanged while repeated DRFs reuse the cached
+    NORMAL reference and its precomputed crop/candidate boxes.
+    """
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        drawn = self._draw(generator)
+
         groups = OrderedDict()
-        for index in drawn:
-            groups.setdefault(self.dataset.group_key(index), []).append(index)
+        for draw_position, row_index in enumerate(drawn):
+            request = _sample_request(row_index, self.seed, self.epoch, draw_position)
+            groups.setdefault(self.dataset.group_key(row_index), []).append(request)
         keys = list(groups)
         if len(keys) > 1:
             key_order = torch.randperm(len(keys), generator=generator).tolist()

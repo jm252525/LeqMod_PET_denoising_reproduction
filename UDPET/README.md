@@ -21,8 +21,8 @@ under `/mnt/sdb/jinming.hu/UDPET/step5_env/code`.
 - QuMod is enabled by the all-cohort dry-run configuration.
 - LeMod is disabled because the current manifests do not provide lesion
   segmentation paths. This snapshot is therefore not a complete LeqMod run.
-- No formal training checkpoint or training-loss file existed at snapshot
-  time.
+- PyTorch 2.7 scheduler creation, a real eight-patch optimizer step, and strict
+  checkpoint reload have passed. No formal training run has started.
 
 ## Project plan
 
@@ -60,7 +60,7 @@ PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/
   /usr/bin/python3 UDPET/code/train_LeqModGan_csv.py \
   --train-csv /mnt/sdb/jinming.hu/UDPET/metrics_step4/input/train.csv \
   --output-path /mnt/sdb/jinming.hu/UDPET/runs \
-  --experiment-name loader_v2_smoke \
+  --experiment-name loader_v3_smoke \
   --sampling-mode volume_grouped_weighted \
   --reference-cache-size 1 \
   --num-workers 2
@@ -71,6 +71,45 @@ Regression test:
 ```bash
 PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/metrics_step4/pydeps \
   /usr/bin/python3 UDPET/code/test_dataset_cache.py
+PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/metrics_step4/pydeps \
+  /usr/bin/python3 UDPET/code/test_training_state.py
+PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/metrics_step4/pydeps \
+  /usr/bin/python3 UDPET/code/test_scheduler_creation.py
+```
+
+## Training and resume contract
+
+- `--n-epochs N` now executes exactly `N` epochs; the previous inclusive loop
+  that executed `N + 1` epochs is removed.
+- PyTorch 2.7 schedulers are constructed without the removed `verbose`
+  argument.
+- Checkpoint version 2 atomically stores raw G/D weights, both optimizers, all
+  schedulers, completed epoch, total iterations, Python/NumPy/CPU/CUDA RNG,
+  DataLoader generator state, sampler epoch, and a training-contract SHA-256.
+- Every sampler emits an explicit per-sample seed. Patch selection and rotation
+  therefore do not depend on persistent-worker scheduling and are reproducible
+  after an epoch-boundary resume.
+- Strict resume is the default. It rejects a changed training contract, a
+  partial-epoch checkpoint, missing loss history, or a legacy checkpoint.
+  `--allow-inexact-resume` is an explicit diagnostic escape hatch and must not
+  be used for a formal run.
+
+The real-data engineering smoke used one study with eight `80x80x80` patches,
+QuMod enabled, and one discriminator plus one generator update on physical
+GPU0. It passed with finite losses, 7,166.5 MiB peak allocated and 10,196 MiB
+peak reserved GPU memory. A 273.4 MiB temporary checkpoint was reloaded with
+identical parameters and restored optimizer, scheduler, CPU/CUDA RNG states;
+the temporary checkpoint was deleted. The JSON report is stored outside Git at
+`/mnt/sdb/jinming.hu/UDPET/loader_checks/optimizer_step_8patch_20260917/report.json`.
+
+Re-run the bounded smoke test with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/metrics_step4/pydeps \
+  /usr/bin/python3 UDPET/code/smoke_optimizer_step.py \
+  --train-csv /mnt/sdb/jinming.hu/UDPET/metrics_step4/input/train.csv \
+  --output-json /mnt/sdb/jinming.hu/UDPET/loader_checks/optimizer_step_8patch_20260917/report.json
 ```
 
 The two `pydeps` directories are pip target directories joined through
@@ -79,12 +118,13 @@ is the system `/usr/bin/python3`. The first path supplies PyTorch/CUDA packages;
 the second supplies NumPy/SciPy/nibabel/scikit-image and related metrics
 packages.
 
-## Known launch blocker
+## Remaining launch gates
 
-The copied training code passes `verbose=True` to PyTorch learning-rate
-schedulers. PyTorch 2.7.0 no longer accepts that argument, so formal training
-must not be launched from this snapshot until the scheduler compatibility is
-fixed and an optimizer-step smoke test passes.
+Scheduler, one-step optimization, eight-patch memory, and epoch-boundary resume
+are no longer blockers. Before a long baseline run, the project still needs a
+fixed validation loop with patient-level quantitative metrics and a bounded
+multi-iteration training smoke. LeMod remains unavailable until lesion masks
+are added to a versioned manifest.
 
 ## Layout
 

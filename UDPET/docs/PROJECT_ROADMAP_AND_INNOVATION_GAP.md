@@ -1,6 +1,6 @@
 # UDPET 项目后续计划与课题创新目标差距
 
-**更新日期：** 2026-09-15  
+**更新日期：** 2026-09-17
 **适用分支：** `codex/udpet-baseline-integration`
 
 ## 1. 拟回答的核心问题
@@ -27,11 +27,14 @@
 - 已完成按检查分组的加权抽样、每 worker 有界 NORMAL 缓存、persistent workers 和回归测试；
 - 在两 worker、5,020 次抽样的固定索引审计中，预计每轮 NORMAL 加载次数由 5,009 降至 1,824，约减少 64%；
 - 真实 manifest 的 loader-only smoke test 已通过，没有启动正式训练。
+- 已修复 PyTorch 2.7 scheduler 和训练轮数多一轮的问题；
+- 已实现版本化的严格 epoch-boundary checkpoint，保存模型、optimizer、scheduler、RNG、DataLoader generator、sampler epoch 和训练配置哈希；
+- 真实数据、8 个 `80³` patch、QuMod 开启的一次 D/G optimizer-step 已通过，峰值 allocated/reserved 显存分别为 7,166.5/10,196 MiB；
+- 临时 checkpoint 回读后参数、optimizer、scheduler 及 CPU/CUDA RNG 均通过一致性验证。
 
 ### 尚未完成
 
 - 尚无可审计的 QuMod/LeqMod 正式训练 checkpoint、训练曲线和验证结果；
-- PyTorch 2.7 scheduler 兼容问题及单次 optimizer-step 测试尚未完成；
 - 尚未建立固定的患者级 SUV 定量评价程序；
 - 当前网络未显式输入 DRF；
 - 尚未训练定量失败风险或置信度校准模型；
@@ -53,8 +56,8 @@ Ruijin 2023 不含 D2，导致中心/年份与 DRF 覆盖不完全平衡。D2 �
 
 | 阶段 | 目标 | 当前状态 | 到达下一阶段的关键缺口 |
 | --- | --- | --- | --- |
-| P0 数据与工程基线 | 患者级划分、可复现 loader、I/O 可用 | 基本完成 | 完成速度实测和 optimizer-step 测试 |
-| P1 QuMod 可复现基线 | 固定配置完成训练并报告患者级结果 | 未完成 | scheduler 修复、训练/验证/保存链路 |
+| P0 数据与工程基线 | 患者级划分、可复现 loader、I/O 可用 | optimizer-step 与严格恢复已通过 | 完成墙钟速度实测和多 iteration 小训练 |
+| P1 QuMod 可复现基线 | 固定配置完成训练并报告患者级结果 | 未完成 | 固定 validation、患者级指标和短预算基线 |
 | P2 全 DRF 定量保真 | 恢复质量提升且 SUV 偏差受控 | 未开始 | 固定定量终点、DRF 条件化、损失消融 |
 | P3 定量失败校准 | 对每次检查输出可靠失败概率 | 未开始 | 失败定义、校准集、风险覆盖评价 |
 | P4 患者特异性解释 | 证明患者因素改变可接受 DRF | 数据受限 | BMI、剂量、时间等患者/协议元数据 |
@@ -68,8 +71,8 @@ Ruijin 2023 不含 D2，导致中心/年份与 DRF 覆盖不完全平衡。D2 �
 
 任务：
 
-1. 修复 PyTorch 2.7 scheduler 参数兼容性；
-2. 加入 CPU/GPU 单次 optimizer-step、保存和恢复测试；
+1. ~~修复 PyTorch 2.7 scheduler 参数兼容性；~~（已完成）
+2. ~~加入 GPU 单次 optimizer-step、保存和恢复测试；~~（已完成）
 3. 用固定的 200–500 batches 对旧 loader 和新 loader 做墙钟时间、CPU 内存、GPU 等待时间对照；
 4. 固定随机种子、患者划分、训练预算、验证 checkpoint 和配置哈希；
 5. 明确每一轮/每个 checkpoint 的实际 optimizer updates，避免以 DataLoader batch 数代替有效更新数。
@@ -179,7 +182,7 @@ Leave-one-DRF-out 不作为临床主任务，只作为模型遇到未训练计�
 
 ## 7. 接下来三个代码里程碑
 
-1. `engineering-gate`：scheduler 兼容修复、optimizer-step/恢复测试和 loader 性能报告；
+1. `engineering-gate`：scheduler、optimizer-step 和严格恢复已通过；剩余 loader 墙钟性能报告及多 iteration 小训练；
 2. `qumod-baseline`：固定配置的全 DRF baseline、患者级定量评价脚本和验证报告；
 3. `drf-conditioned-risk`：DRF 条件化消融、定量保真损失和验证集概率校准。
 

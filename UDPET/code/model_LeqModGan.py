@@ -1,9 +1,14 @@
 from collections import OrderedDict
+import os
+from pathlib import Path
+
 import torch.nn as nn
 import torch.utils.data
 from nets_GAN import Unet, gaussian_weights_init, Discriminator
 from torch.optim import lr_scheduler
 from torch.nn import MSELoss, L1Loss
+
+from training_state import CHECKPOINT_VERSION
 
 
 class LSGANLoss(nn.Module):
@@ -64,7 +69,9 @@ class modelGAN(nn.Module):
 
     def initialize(self):
         if self.opts.preWeight is not None:
-            checkpoint = torch.load(self.opts.preWeight, map_location=self.opts.device)
+            checkpoint = torch.load(
+                self.opts.preWeight, map_location=self.opts.device, weights_only=False
+            )
             self._unwrap(self.net_G).load_state_dict(checkpoint['net_G'], strict=True)
             self._unwrap(self.net_D).load_state_dict(checkpoint['net_D'], strict=True)
             print('generator and discriminator intialized from: ', self.opts.preWeight)
@@ -73,15 +80,24 @@ class modelGAN(nn.Module):
             self.net_D.apply(gaussian_weights_init)
             print('generator and discriminator intialized from Gaussian_weights')
 
-    def set_scheduler(self, opts, epoch=-1):
+    def set_scheduler(self, opts):
         if opts.lr_policy == 'multistep':
-            self.schedulers = [lr_scheduler.MultiStepLR(optimizer, milestones=opts.multi_step_size, gamma=opts.gamma, last_epoch=-1, verbose=True) for optimizer in self.optimizers]
+            self.schedulers = [lr_scheduler.MultiStepLR(
+                optimizer, milestones=opts.multi_step_size, gamma=opts.gamma
+            ) for optimizer in self.optimizers]
         elif opts.lr_policy == 'cosine':
-            self.schedulers = [lr_scheduler.CosineAnnealingLR(optimizer, T_max=opts.n_epochs, eta_min=0, last_epoch=-1, verbose=True) for optimizer in self.optimizers]
+            self.schedulers = [lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=opts.n_epochs, eta_min=0
+            ) for optimizer in self.optimizers]
         elif opts.lr_policy == 'ReduceLROnPlateau':
-            self.schedulers = [lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=opts.gamma, patience=opts.Plateau_step_size, cooldown=1, verbose=True) for optimizer in self.optimizers]
+            self.schedulers = [lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=opts.gamma,
+                patience=opts.Plateau_step_size, cooldown=1,
+            ) for optimizer in self.optimizers]
         else:
-            NotImplementedError('learning rate policy [%s] is not implemented', opts.lr_policy)
+            raise NotImplementedError(
+                'learning rate policy [{}] is not implemented'.format(opts.lr_policy)
+            )
 
     def set_input(self, data):
         self.inp_vol_low = data['vol_low'].flatten(0,1).to(self.opts.device).float().unsqueeze(dim=1)  # [B,1,X,Y,Z]
@@ -175,24 +191,46 @@ class modelGAN(nn.Module):
         print('learning rate = {:7f}'.format(lr))
         return lr
 
-    def save(self, filename, epoch, total_iter):
-        state = {}
+    def save(self, filename, epoch, total_iter, training_state):
+        state = {'checkpoint_version': CHECKPOINT_VERSION}
         state['net_G'] = self._unwrap(self.net_G).state_dict()
         state['net_D'] = self._unwrap(self.net_D).state_dict()
         state['opt_G'] = self.optimizer_G.state_dict()
         state['opt_D'] = self.optimizer_D.state_dict()
+        state['schedulers'] = [scheduler.state_dict() for scheduler in self.schedulers]
         state['epoch'] = epoch
+        state['completed_epochs'] = epoch + 1
         state['total_iter'] = total_iter
-        torch.save(state, filename)
+        state['training_state'] = training_state
+        filename = Path(filename)
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        temporary = filename.with_suffix(filename.suffix + '.tmp')
+        torch.save(state, temporary)
+        os.replace(temporary, filename)
         print('Saved {}'.format(filename))
 
-    def resume(self, checkpoint_file, train=True):
-        checkpoint = torch.load(checkpoint_file, map_location=self.opts.device)
+    def resume(self, checkpoint_file, train=True, strict_training_state=True):
+        checkpoint = torch.load(
+            checkpoint_file, map_location=self.opts.device, weights_only=False
+        )
         self._unwrap(self.net_G).load_state_dict(checkpoint['net_G'])
         self._unwrap(self.net_D).load_state_dict(checkpoint['net_D'])
         if train:
             self.optimizer_G.load_state_dict(checkpoint['opt_G'])
             self.optimizer_D.load_state_dict(checkpoint['opt_D'])
+            scheduler_states = checkpoint.get('schedulers')
+            if scheduler_states is None:
+                if strict_training_state:
+                    raise ValueError('Strict resume requires scheduler states')
+            else:
+                if len(scheduler_states) != len(self.schedulers):
+                    raise ValueError(
+                        'Scheduler count mismatch: checkpoint={} current={}'.format(
+                            len(scheduler_states), len(self.schedulers)
+                        )
+                    )
+                for scheduler, scheduler_state in zip(self.schedulers, scheduler_states):
+                    scheduler.load_state_dict(scheduler_state)
 
         print('Loaded {}'.format(checkpoint_file))
-        return checkpoint['epoch'], checkpoint['total_iter']
+        return checkpoint

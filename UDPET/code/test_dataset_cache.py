@@ -12,7 +12,12 @@ import nibabel as nib
 import numpy as np
 import torch
 
-from CSVPairDataset import CSVPairDataset, VolumeGroupedWeightedSampler
+from CSVPairDataset import (
+    CSVPairDataset,
+    VolumeGroupedWeightedSampler,
+    make_epoch_shuffle_sampler,
+    make_weighted_sampler,
+)
 
 
 class _SamplerDataset:
@@ -78,10 +83,8 @@ class DatasetCacheTest(unittest.TestCase):
 
     def test_shared_normal_reference_is_loaded_once(self):
         dataset = self.make_dataset(cache_size=1)
-        np.random.seed(7)
-        first = dataset[0]
-        np.random.seed(7)
-        second = dataset[1]
+        first = dataset[(0, 7)]
+        second = dataset[(1, 7)]
         stats = dataset.io_stats()
         self.assertEqual(stats["full_loads"], 1)
         self.assertEqual(stats["low_loads"], 2)
@@ -107,7 +110,8 @@ class DatasetCacheTest(unittest.TestCase):
         seed = 23
         num_samples = 100
         sampler = VolumeGroupedWeightedSampler(dataset, seed, num_samples)
-        grouped_draw = list(sampler)
+        grouped_requests = list(sampler)
+        grouped_draw = [row_index for row_index, _ in grouped_requests]
 
         generator = torch.Generator().manual_seed(seed)
         direct_draw = torch.multinomial(
@@ -124,9 +128,38 @@ class DatasetCacheTest(unittest.TestCase):
             if position == 0 or group != observed_groups[position - 1]
         ]
         self.assertEqual(len(group_runs), len(set(group_runs)))
-        self.assertEqual(grouped_draw, list(VolumeGroupedWeightedSampler(dataset, seed, num_samples)))
+        self.assertEqual(
+            grouped_requests,
+            list(VolumeGroupedWeightedSampler(dataset, seed, num_samples)),
+        )
         sampler.set_epoch(1)
-        self.assertNotEqual(grouped_draw, list(sampler))
+        self.assertNotEqual(grouped_requests, list(sampler))
+
+    def test_sample_request_is_independent_of_global_rng_state(self):
+        dataset = self.make_dataset(cache_size=1)
+        dataset.augmentation = True
+        request = (0, 123456)
+        np.random.seed(1)
+        first = dataset[request]
+        np.random.seed(999)
+        second = dataset[request]
+        torch.testing.assert_close(first["vol_low"], second["vol_low"])
+        torch.testing.assert_close(first["vol_high"], second["vol_high"])
+        self.assertEqual(first["sample_seed"], second["sample_seed"])
+
+    def test_all_sampler_modes_are_epoch_deterministic(self):
+        dataset = _SamplerDataset()
+        factories = (
+            lambda: make_weighted_sampler(dataset, 31, 4),
+            lambda: VolumeGroupedWeightedSampler(dataset, 31, 4),
+            lambda: make_epoch_shuffle_sampler(dataset, 31, 4),
+        )
+        for factory in factories:
+            first = factory()
+            epoch_zero = list(first)
+            self.assertEqual(epoch_zero, list(factory()))
+            first.set_epoch(1)
+            self.assertNotEqual(epoch_zero, list(first))
 
 
 if __name__ == "__main__":
