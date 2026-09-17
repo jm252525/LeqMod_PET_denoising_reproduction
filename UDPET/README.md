@@ -50,8 +50,12 @@ available by combining `--sampling-mode csv_weighted`,
 For the fixed train manifest, seed `20260910`, 5,020 epoch samples, two workers,
 and a one-reference cache, an index-only locality audit estimates 1,824 NORMAL
 loads per epoch versus 5,009 with the legacy random order (about 64% fewer).
-This is a predicted decompression count, not a wall-clock benchmark; storage
-throughput and worker scheduling still need measurement before a long run.
+This remains a predicted decompression count, not evidence of speed. A later
+ABBA wall-clock benchmark processed 200 real batches per arm and found the
+optimized loader about 0.6% slower in total and 1.2% slower in steady fetch
+mean, with essentially unchanged GPU-forward wait. See
+`docs/LOADER_BENCHMARK_REPORT_20260917.md`. The grouping/cache behavior is kept
+for reproducibility, but is not considered a promoted throughput optimization.
 
 Example loader-only smoke test (no optimizer steps are run without
 `--run-training`):
@@ -161,10 +165,11 @@ values are pipeline checks rather than scientific estimates.
 
 Scheduler, one-step optimization, eight-patch memory, fixed patient-level
 validation, multi-iteration execution, and exact epoch-boundary resume are no
-longer blockers. Before a long baseline run, freeze the baseline configuration,
-run the pending loader wall-clock benchmark, and predeclare the full validation
-set/checkpoint rule. LeMod remains unavailable until lesion masks are added to
-a versioned manifest.
+longer blockers. The loader wall-clock gate is also complete, but it showed no
+throughput benefit; component-level I/O/patch profiling should precede another
+optimization. Before a long baseline run, freeze the baseline configuration
+and predeclare the full validation set/checkpoint rule. LeMod remains
+unavailable until lesion masks are added to a versioned manifest.
 
 ## Layout
 
@@ -173,3 +178,5 @@ a versioned manifest.
   dataset counts, and source hashes
 - `docs/ENGINEERING_GATE_REPORT_20260917.md`: bounded real-data engineering
   evidence; not a QuMod efficacy result
+- `docs/LOADER_BENCHMARK_REPORT_20260917.md`: ABBA wall-clock, memory, and
+  GPU-forward starvation comparison

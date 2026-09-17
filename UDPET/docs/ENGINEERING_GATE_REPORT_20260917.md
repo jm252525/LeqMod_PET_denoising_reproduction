@@ -58,7 +58,8 @@
 
 ## 仍未通过的正式启动前事项
 
-1. 完成旧/新 loader 的固定 200–500 batch 墙钟时间、CPU 内存和 GPU 等待对照；
-2. 冻结 QuMod baseline 的完整训练配置、全 validation 请求集、训练预算和 checkpoint 选择规则；
-3. 用 `run_role=qumod_baseline` 启动短预算基线，检查完整 validation 各 DRF 覆盖后再考虑长训练；
-4. 在缺少 lesion mask 时继续禁用 LeMod，且不得把 reference-defined hotspot 写成病灶。
+1. ~~完成旧/新 loader 的固定 200-batch/arm 墙钟、内存和 GPU-forward 等待对照；~~结果为现有优化没有吞吐收益，见 `LOADER_BENCHMARK_REPORT_20260917.md`；
+2. 对 NIfTI 解压、crop/candidate、patch/rotation 和 H2D 做分阶段 profile，再决定下一项 loader 改造；
+3. 冻结 QuMod baseline 的完整训练配置、全 validation 请求集、训练预算和 checkpoint 选择规则；
+4. 用 `run_role=qumod_baseline` 启动短预算基线，检查完整 validation 各 DRF 覆盖后再考虑长训练；
+5. 在缺少 lesion mask 时继续禁用 LeMod，且不得把 reference-defined hotspot 写成病灶。

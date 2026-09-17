@@ -1,7 +1,7 @@
 {
   "snapshot": {
     "created_at": "2026-09-15T01:08:59+08:00",
-    "status": "training_validation_exact_resume_gate_passed_no_formal_run",
+    "status": "engineering_gates_complete_loader_speedup_not_observed_no_formal_run",
     "last_verified_on": "2026-09-17",
     "source_code_path": "/mnt/sdb/jinming.hu/UDPET/step5_env/code",
     "repository_code_path": "/home/jinming.hu/LeqMod_PET_denoising_reproduction/UDPET/code",
@@ -36,7 +36,8 @@
     "training_state.py": "fa994cff31d2985bbec4d3f0dca54f67e207372d6499d0d80e5efeb7fe6d7117",
     "train_LeqModGan_csv.py": "4f6fa79ebb6a3d1bcf74542a2ceca83f646b0dc2c9179676331247a5ec2dd9c6",
     "validation.py": "7176ca8e9310d2200f611ebc0b09cd877727beb32338fa8ed3c05e32abbcb60a",
-    "test_validation_metrics.py": "0439653bb0ab771aef699a4a1a30596143991a7f6a047c3e8f77b4eb6ff4f6f6"
+    "test_validation_metrics.py": "0439653bb0ab771aef699a4a1a30596143991a7f6a047c3e8f77b4eb6ff4f6f6",
+    "benchmark_loader_pipeline.py": "45a2bbaa0d404f9f0b06ef78024810e06c8a072a81603ff4fa6bba4d4f46b004"
   },
   "data_summary": {
     "cohorts": {
@@ -82,6 +83,8 @@
     "exact_resumed_vs_continuous_state": true,
     "fixed_patient_drf_validation": true,
     "patient_bootstrap_confidence_intervals": true,
+    "loader_wall_clock_benchmark_complete": true,
+    "loader_throughput_optimization_promoted": false,
     "test_manifest_read_by_engineering_smoke": false,
     "real_8patch_optimizer_step_passed": true,
     "loader_optimization": {
@@ -125,6 +128,35 @@
         "loss_csv": true,
         "validation_artifacts": true
       }
+    },
+    "loader_abba_benchmark": {
+      "artifact": "/mnt/sdb/jinming.hu/UDPET/loader_benchmarks/loader_abba_200_per_arm_20260917",
+      "protocol": "legacy-optimized-optimized-legacy",
+      "batches_per_arm": 200,
+      "unique_requests_repeated_per_arm": 100,
+      "request_multiset_sha256": "059dceb692f0e1af0d0754a695fd3cb725ee223ae473799dca63738229bf870e",
+      "same_request_checksum_max_spread": 0.0,
+      "legacy": {
+        "median_wall_seconds_per_100_batches": 219.6152854040265,
+        "median_fetch_steady_mean_seconds": 2.036906959802697,
+        "median_gpu_wait_fraction_steady": 0.9554171839160032,
+        "maximum_tree_pss_mib": 3438.4423828125
+      },
+      "optimized": {
+        "median_wall_seconds_per_100_batches": 220.97142749279737,
+        "median_fetch_steady_mean_seconds": 2.0618618997549145,
+        "median_gpu_wait_fraction_steady": 0.9557682645564228,
+        "maximum_tree_pss_mib": 3279.2236328125
+      },
+      "comparison": {
+        "pipeline_wall_speedup_legacy_over_optimized": 0.9938628169978444,
+        "steady_fetch_speedup_legacy_over_optimized": 0.9878968906912806,
+        "gpu_wait_fraction_absolute_change_optimized_minus_legacy": 0.00035108064041966536,
+        "tree_pss_ratio_optimized_over_legacy": 0.9536945127259147
+      },
+      "report_sha256": "9fb32db8bca5f8dccd1faeacbce17f2cf8c2adec088df08569f008273bb43c24",
+      "batch_csv_sha256": "8d0bf0f1e452e2a1204efabbbecccf614a3a61d9e46323cb88d0d512a6248108",
+      "log_sha256": "1eecb7af7937c3bce7268d908ec92d61a583920f1f175bad5c7792f5aa3f07f1"
     }
   }
 }
