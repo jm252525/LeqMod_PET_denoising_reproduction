@@ -27,8 +27,12 @@ under `/mnt/sdb/jinming.hu/UDPET/step5_env/code`.
 - The complete four-split HDF5 cache has been built and audited. All 1,163
   containers, 7,463 image datasets, and 727,522,124,800 stored voxels decoded
   successfully; cross-center full-volume and model-patch comparisons were
-  exactly equal to the NIfTI backend. HDF5 remains opt-in pending the bounded
-  training/resume comparison.
+  exactly equal to the NIfTI backend.
+- The HDF5 train/validation backend is now bound into the strict resume
+  contract by backend identity and complete train/validation index hashes. A
+  one-GPU bounded comparison passed exact continuous/resume and HDF5/NIfTI
+  state equivalence. HDF5 is the recommended explicit working backend for the
+  next baseline experiments; NIfTI remains the archival source of truth.
 
 ## Project plan
 
@@ -90,6 +94,19 @@ eight-patch matches, with maximum absolute difference 0.0 for low-count,
 NORMAL, and weight tensors. See
 `docs/FULL_HDF5_CACHE_AUDIT_20260918.md`.
 
+The formal training entry point now accepts `--storage-backend hdf5`, separate
+train and validation cache indexes, and a bounded per-worker handle cache. The
+backend, both complete index SHA-256 values, and the handle-cache setting are
+part of training protocol `udpet_training_v7_storage_bound_resume_20260918`.
+Changing backends or index content therefore causes strict resume to fail.
+
+On physical GPU 2, a bounded two-update HDF5 run, an interrupted/resumed HDF5
+run, and a matched NIfTI run produced exactly equal model, optimizer, scheduler,
+RNG, loss-history, and validation states (apart from the deliberately distinct
+HDF5/NIfTI training-contract hash). HDF5 wall time was 12.55 s versus 22.99 s
+for NIfTI in this tiny run; this is a training-path check, not a throughput
+benchmark. See `docs/HDF5_TRAINING_GATE_20260918.md`.
+
 Re-run the full audit with:
 
 ```bash
@@ -122,6 +139,20 @@ PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/
   --num-workers 2
 ```
 
+HDF5 train/validation runs must name both immutable indexes explicitly:
+
+```bash
+PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/hdf5_cache_env/pydeps:/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/metrics_step4/pydeps \
+  /usr/bin/python3 UDPET/code/train_LeqModGan_csv.py \
+  --train-csv /mnt/sdb/jinming.hu/UDPET/metrics_step4/input/train.csv \
+  --val-csv /mnt/sdb/jinming.hu/UDPET/metrics_step4/input/val.csv \
+  --output-path /mnt/sdb/jinming.hu/UDPET/runs \
+  --experiment-name hdf5_qumod_example \
+  --storage-backend hdf5 \
+  --chunk-cache-index /mnt/sdb/jinming.hu/UDPET/hdf5_cache_v1_full_20260917/train/index.json \
+  --val-chunk-cache-index /mnt/sdb/jinming.hu/UDPET/hdf5_cache_v1_full_20260917/val/index.json
+```
+
 Regression test:
 
 ```bash
@@ -135,6 +166,8 @@ PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/
   /usr/bin/python3 UDPET/code/test_validation_metrics.py
 PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/hdf5_cache_env/pydeps:/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/metrics_step4/pydeps \
   /usr/bin/python3 UDPET/code/test_hdf5_patch_cache.py
+PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/hdf5_cache_env/pydeps:/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/metrics_step4/pydeps \
+  /usr/bin/python3 UDPET/code/test_training_storage_contract.py
 ```
 
 ## Training and resume contract
@@ -218,15 +251,11 @@ values are pipeline checks rather than scientific estimates.
 
 Scheduler, one-step optimization, eight-patch memory, fixed patient-level
 validation, multi-iteration execution, and exact epoch-boundary resume are no
-longer blockers. The loader wall-clock gate is also complete, but it showed no
-throughput benefit; component-level I/O/patch profiling should precede another
-optimization. Full-cache construction, integrity, and cross-center numerical
-equivalence are complete. Before making HDF5 the formal default, bind the cache
-index hashes/backend identity into the strict training contract and run a
-bounded multi-iteration train/validation/resume comparison against NIfTI.
-Before a long baseline run, freeze the baseline configuration and predeclare
-the full validation set/checkpoint rule. LeMod remains unavailable until lesion
-masks are added to a versioned manifest.
+longer blockers. Full-cache construction, integrity, cross-center numerical
+equivalence, storage-contract binding, and the bounded HDF5/NIfTI
+training/resume gate are also complete. Before a long baseline run, freeze the
+baseline configuration and predeclare the full validation set/checkpoint rule.
+LeMod remains unavailable until lesion masks are added to a versioned manifest.
 
 ## Layout
 
@@ -241,3 +270,5 @@ masks are added to a versioned manifest.
   storage, throughput, memory, and optimizer-step pilot
 - `docs/FULL_HDF5_CACHE_AUDIT_20260918.md`: four-split coverage, full HDF5
   decoded-data integrity, and cross-center NIfTI-equivalence audit
+- `docs/HDF5_TRAINING_GATE_20260918.md`: one-GPU HDF5/NIfTI training,
+  validation, strict-resume, and storage-contract comparison
