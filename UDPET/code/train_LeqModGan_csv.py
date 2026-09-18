@@ -54,6 +54,28 @@ def parse_args():
     parser.add_argument("--augmentation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rotate-train", type=int, default=10)
     parser.add_argument("--validate-paths", action="store_true")
+    parser.add_argument(
+        "--storage-backend",
+        choices=("nifti", "hdf5"),
+        default="nifti",
+        help="Image storage used by both train and validation datasets",
+    )
+    parser.add_argument(
+        "--chunk-cache-index",
+        default=None,
+        help="Train HDF5 index.json; required with --storage-backend hdf5",
+    )
+    parser.add_argument(
+        "--val-chunk-cache-index",
+        default=None,
+        help="Validation HDF5 index.json; required when HDF5 validation is enabled",
+    )
+    parser.add_argument(
+        "--hdf5-handle-cache-size",
+        type=int,
+        default=1,
+        help="Maximum open HDF5 study handles in each DataLoader worker",
+    )
 
     parser.add_argument("--enable-lemod", action="store_true")
     parser.add_argument("--adapt-lesion-sampling", action=argparse.BooleanOptionalAction, default=True)
@@ -135,15 +157,58 @@ def summarize_batch(batch, torch):
     }
 
 
+def build_storage_contract(
+    storage_backend,
+    train_chunk_cache_index=None,
+    val_chunk_cache_index=None,
+    hdf5_handle_cache_size=1,
+):
+    """Return the storage identity that is bound into strict resume.
+
+    Paths are deliberately excluded because moving an unchanged cache must not
+    change the scientific contract. The complete index bytes are hashed, so a
+    changed row mapping, cache metadata, or cache path is still detected.
+    """
+    backend = str(storage_backend).strip().lower()
+    if backend not in {"nifti", "hdf5"}:
+        raise ValueError(f"Unsupported storage backend: {storage_backend}")
+    if int(hdf5_handle_cache_size) < 1:
+        raise ValueError("--hdf5-handle-cache-size must be positive")
+    if backend == "hdf5":
+        if train_chunk_cache_index is None:
+            raise ValueError(
+                "--chunk-cache-index is required with --storage-backend hdf5"
+            )
+        train_index_sha256 = sha256(train_chunk_cache_index)
+        val_index_sha256 = (
+            sha256(val_chunk_cache_index)
+            if val_chunk_cache_index is not None else None
+        )
+    else:
+        if train_chunk_cache_index is not None or val_chunk_cache_index is not None:
+            raise ValueError(
+                "Chunk-cache indexes may only be supplied with --storage-backend hdf5"
+            )
+        train_index_sha256 = None
+        val_index_sha256 = None
+    return {
+        "backend": backend,
+        "train_chunk_cache_index_sha256": train_index_sha256,
+        "val_chunk_cache_index_sha256": val_index_sha256,
+        "hdf5_handle_cache_size_per_worker": int(hdf5_handle_cache_size),
+    }
+
+
 def build_training_contract(
     opts,
     train_csv_sha256,
     effective_epoch_samples,
     val_csv_sha256=None,
     effective_val_pairs=None,
+    storage_contract=None,
 ):
     return {
-        "protocol": "udpet_training_v6_exact_resume_20260917",
+        "protocol": "udpet_training_v7_storage_bound_resume_20260918",
         "seed": opts.seed,
         "run_role": opts.run_role,
         "train_csv_sha256": train_csv_sha256,
@@ -174,6 +239,7 @@ def build_training_contract(
         "multi_step_size": list(opts.multi_step_size),
         "device_type": opts.device.type,
         "visible_gpu_count": opts.numGPUs,
+        "storage": storage_contract,
         "numerical_determinism": {
             "torch_deterministic_algorithms": "strict",
             "cublas_workspace_config": ":4096:8",
@@ -205,6 +271,8 @@ def main():
         raise ValueError("--prefetch-factor must be positive")
     if opts.reference_cache_size < 0:
         raise ValueError("--reference-cache-size must be non-negative")
+    if opts.hdf5_handle_cache_size < 1:
+        raise ValueError("--hdf5-handle-cache-size must be positive")
     if opts.n_epochs <= 0:
         raise ValueError("--n-epochs must be positive")
     if opts.save_model_epochs <= 0:
@@ -227,6 +295,24 @@ def main():
         raise ValueError("--resume and --pre-weight cannot be used together")
     if opts.run_training and opts.val_csv is None:
         raise ValueError("--val-csv is required with --run-training")
+    if opts.storage_backend == "hdf5" and opts.chunk_cache_index is None:
+        raise ValueError(
+            "--chunk-cache-index is required with --storage-backend hdf5"
+        )
+    if (
+        opts.storage_backend == "hdf5"
+        and opts.val_csv is not None
+        and opts.val_chunk_cache_index is None
+    ):
+        raise ValueError(
+            "--val-chunk-cache-index is required for HDF5 validation"
+        )
+    if opts.storage_backend == "nifti" and (
+        opts.chunk_cache_index is not None or opts.val_chunk_cache_index is not None
+    ):
+        raise ValueError(
+            "Chunk-cache indexes may only be supplied with --storage-backend hdf5"
+        )
     if opts.run_training and opts.lr_policy == "ReduceLROnPlateau" and opts.val_every_epochs != 1:
         raise ValueError("ReduceLROnPlateau requires --val-every-epochs 1")
     if opts.gpu_ids is not None:
@@ -309,6 +395,9 @@ def main():
         rotate_degrees=opts.rotate_train,
         enable_lemod=opts.enable_lemod,
         reference_cache_size=opts.reference_cache_size,
+        storage_backend=opts.storage_backend,
+        chunk_cache_index=opts.chunk_cache_index,
+        hdf5_handle_cache_size=opts.hdf5_handle_cache_size,
         seed=opts.seed,
         validate_paths=opts.validate_paths,
     )
@@ -355,6 +444,9 @@ def main():
             rotate_degrees=0,
             enable_lemod=False,
             reference_cache_size=opts.reference_cache_size,
+            storage_backend=opts.storage_backend,
+            chunk_cache_index=opts.val_chunk_cache_index,
+            hdf5_handle_cache_size=opts.hdf5_handle_cache_size,
             seed=opts.seed + 1,
             validate_paths=opts.validate_paths,
         )
@@ -383,6 +475,12 @@ def main():
     output_directory.mkdir(parents=True, exist_ok=True)
     train_csv_sha256 = sha256(opts.train_csv)
     val_csv_sha256 = sha256(opts.val_csv) if opts.val_csv is not None else None
+    storage_contract = build_storage_contract(
+        opts.storage_backend,
+        opts.chunk_cache_index,
+        opts.val_chunk_cache_index if opts.val_csv is not None else None,
+        opts.hdf5_handle_cache_size,
+    )
     effective_val_pairs = len(val_sampler) if val_sampler is not None else None
     training_contract = build_training_contract(
         opts,
@@ -390,14 +488,26 @@ def main():
         effective_epoch_samples,
         val_csv_sha256,
         effective_val_pairs,
+        storage_contract,
     )
     training_contract_sha256 = canonical_sha256(training_contract)
     config = {
-        "protocol": "udpet_training_v6_exact_resume_20260917",
+        "protocol": "udpet_training_v7_storage_bound_resume_20260918",
         "seed": opts.seed,
         "train_csv": str(Path(opts.train_csv).resolve()),
         "train_csv_sha256": train_csv_sha256,
         "dataset": dataset.summary(),
+        "storage": {
+            **storage_contract,
+            "train_chunk_cache_index": (
+                str(Path(opts.chunk_cache_index).resolve())
+                if opts.chunk_cache_index is not None else None
+            ),
+            "val_chunk_cache_index": (
+                str(Path(opts.val_chunk_cache_index).resolve())
+                if opts.val_chunk_cache_index is not None else None
+            ),
+        },
         "validation": None if val_dataset is None else {
             "val_csv": str(Path(opts.val_csv).resolve()),
             "val_csv_sha256": val_csv_sha256,
