@@ -24,6 +24,11 @@ under `/mnt/sdb/jinming.hu/UDPET/step5_env/code`.
 - PyTorch 2.7 scheduler creation, a real eight-patch optimizer step, fixed
   patient-level validation, and an exact interrupted-versus-continuous resume
   comparison have passed. No formal training run has started.
+- The complete four-split HDF5 cache has been built and audited. All 1,163
+  containers, 7,463 image datasets, and 727,522,124,800 stored voxels decoded
+  successfully; cross-center full-volume and model-patch comparisons were
+  exactly equal to the NIfTI backend. HDF5 remains opt-in pending the bounded
+  training/resume comparison.
 
 ## Project plan
 
@@ -73,6 +78,30 @@ speedup, 4.95x steady fetch speedup, and HDF5/NIfTI process-tree PSS of 0.357.
 One real eight-patch QuMod optimizer step and strict checkpoint round-trip also
 passed. This promotes the design to a full-cache candidate, not yet to the
 formal default. See `docs/HDF5_PATCH_CACHE_EXPERIMENT_20260917.md`.
+
+The full train/validation/Bern-test/Ruijin-test cache was subsequently built at
+`/mnt/sdb/jinming.hu/UDPET/hdf5_cache_v1_full_20260917`. It contains 1,163
+study containers and occupies 458.387 GiB versus 228.817 GiB of unique source
+NIfTI files. A read-only audit opened every container and dataset, decoded all
+727,522,124,800 voxels, and found no non-finite values, negative values, or
+coverage/metadata errors. A deterministic two-per-`split x center x DRF`
+sample produced 139/139 exact full-volume matches and 72/72 exact augmented
+eight-patch matches, with maximum absolute difference 0.0 for low-count,
+NORMAL, and weight tensors. See
+`docs/FULL_HDF5_CACHE_AUDIT_20260918.md`.
+
+Re-run the full audit with:
+
+```bash
+PYTHONPATH=/mnt/sdb/jinming.hu/UDPET/hdf5_cache_env/pydeps:/mnt/sdb/jinming.hu/UDPET/step5_env/pydeps:/mnt/sdb/jinming.hu/UDPET/metrics_step4/pydeps \
+  /usr/bin/python3 UDPET/code/audit_full_hdf5_cache.py \
+  --cache-root /mnt/sdb/jinming.hu/UDPET/hdf5_cache_v1_full_20260917 \
+  --output-json /mnt/sdb/jinming.hu/UDPET/hdf5_cache_v1_full_20260917/audit/full_audit.json \
+  --comparison-per-stratum 2 \
+  --patches-per-volume 8 \
+  --full-data-scan \
+  --scan-workers 4
+```
 
 The optional backend requires the isolated dependency in
 `configs/hdf5_cache_requirements.txt`. Cache construction is atomic, refuses to
@@ -191,9 +220,13 @@ Scheduler, one-step optimization, eight-patch memory, fixed patient-level
 validation, multi-iteration execution, and exact epoch-boundary resume are no
 longer blockers. The loader wall-clock gate is also complete, but it showed no
 throughput benefit; component-level I/O/patch profiling should precede another
-optimization. Before a long baseline run, freeze the baseline configuration
-and predeclare the full validation set/checkpoint rule. LeMod remains
-unavailable until lesion masks are added to a versioned manifest.
+optimization. Full-cache construction, integrity, and cross-center numerical
+equivalence are complete. Before making HDF5 the formal default, bind the cache
+index hashes/backend identity into the strict training contract and run a
+bounded multi-iteration train/validation/resume comparison against NIfTI.
+Before a long baseline run, freeze the baseline configuration and predeclare
+the full validation set/checkpoint rule. LeMod remains unavailable until lesion
+masks are added to a versioned manifest.
 
 ## Layout
 
@@ -206,3 +239,5 @@ unavailable until lesion masks are added to a versioned manifest.
   GPU-forward starvation comparison
 - `docs/HDF5_PATCH_CACHE_EXPERIMENT_20260917.md`: direct-patch cache numerical,
   storage, throughput, memory, and optimizer-step pilot
+- `docs/FULL_HDF5_CACHE_AUDIT_20260918.md`: four-split coverage, full HDF5
+  decoded-data integrity, and cross-center NIfTI-equivalence audit
